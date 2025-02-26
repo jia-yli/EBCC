@@ -1,0 +1,6 @@
+image = "/capstor/scratch/cscs/ljiayong/enroot_images/ebcc.sqsh"
+mounts = ["/capstor/scratch/cscs/ljiayong:/capstor/scratch/cscs/ljiayong",
+          "/users/ljiayong/projects/EBCC:/users/ljiayong/projects/EBCC",
+          ]
+workdir = "/users/ljiayong/projects/EBCC"
+writable = true

@@ -8,3 +8,4 @@ data/compressed.nc
 .devcontainer
 .vscode
 *.nc
+slurm_out/
