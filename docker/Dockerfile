@@ -2,9 +2,9 @@
 FROM python:3.9
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV TZ=UTC
+# ENV TZ=UTC
 
-WORKDIR /workspace
+# WORKDIR /workspace
 
 # Install basic apt packages.
 RUN apt-get update && \

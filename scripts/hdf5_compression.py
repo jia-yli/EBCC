@@ -4,7 +4,7 @@ os.environ["HDF5_PLUGIN_PATH"] = os.path.join(current_folder, '../src/build/lib'
 
 import h5py
 import numpy as np
-from ebcc_wrapper import JP2SPWV_Filter
+from ebcc_wrapper import EBCC_Filter
 
 def compress_hdf5(input_hdf5, output_hdf5):
   """
@@ -19,7 +19,7 @@ def compress_hdf5(input_hdf5, output_hdf5):
     for var_name in hdf5_in.keys():
       data = np.array(hdf5_in[var_name])  # Read dataset
 
-      jp2spwv_filter = JP2SPWV_Filter(
+      ebcc_filter = EBCC_Filter(
         base_cr=100, # base compression ratio
         height=data.shape[-2],  # height of each 2D data chunk
         width=data.shape[-1],  # width of each 2D data chunk
@@ -27,10 +27,10 @@ def compress_hdf5(input_hdf5, output_hdf5):
         residual_opt=("max_error_target", 1),
         filter_path=os.path.join(current_folder, 'src')) # directory to the compiled HDF5 filter plugin
 
-      print(dict(jp2spwv_filter))
+      print(dict(ebcc_filter))
 
       # Save dataset with new compression
-      # hdf5_out.create_dataset(var_name, data=data, **jp2spwv_filter)
+      # hdf5_out.create_dataset(var_name, data=data, **ebcc_filter)
       hdf5_out.create_dataset(var_name, data=data, compression='gzip')
 
     # Copy attributes

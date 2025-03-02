@@ -7,7 +7,7 @@ import xarray as xr
 import h5py
 import numpy as np
 import pandas as pd
-from ebcc_wrapper import JP2SPWV_Filter
+from ebcc_wrapper import EBCC_Filter
 import itertools
 import multiprocessing as mp
 import matplotlib.pyplot as plt
@@ -120,14 +120,14 @@ def compress_hdf5_ebcc_uniform(input_hdf5, output_hdf5, ebcc_base_compression_ra
     with h5py.File(output_hdf5, 'w') as hdf5_out:
       for var_name in hdf5_in.keys():
         data = np.array(hdf5_in[var_name])  # Read dataset
-        jp2spwv_filter = JP2SPWV_Filter(
+        ebcc_filter = EBCC_Filter(
           base_cr=ebcc_base_compression_ratio, # base compression ratio
           height=data.shape[-2],  # height of each 2D data chunk
           width=data.shape[-1],  # width of each 2D data chunk
           data_dim=len(data.shape), # data dimension, required to specify the HDF5 chunk shape
           residual_opt=("max_error_target", ebcc_max_error),
           filter_path=os.path.join(current_folder, '../src')) # directory to the compiled HDF5 filter plugin
-        hdf5_out.create_dataset(var_name, data=data, **jp2spwv_filter)
+        hdf5_out.create_dataset(var_name, data=data, **ebcc_filter)
 
       # Copy attributes
       for attr_name, attr_value in hdf5_in.attrs.items():
@@ -193,64 +193,58 @@ def plot_compression_error_dist(output_path, variable, ebcc_base_compression_rat
       plt.close()
 
 if __name__ == '__main__':
-  # variable_lst = [
-  #   "10m_u_component_of_wind",
-  #   "10m_v_component_of_wind",
-  #   "2m_temperature",
-  #   "total_precipitation"
-  # ]
   variable_lst = [
     "10m_u_component_of_wind",
     "10m_v_component_of_wind",
+    "2m_temperature",
+    "total_precipitation"
   ]
+
   # global value
   for variable_idx in range(len(variable_lst)):
     variable = variable_lst[variable_idx]
     output_path = f'/capstor/scratch/cscs/ljiayong/workspace/EBCC'
     os.makedirs(output_path, exist_ok = True)
 
-    # '''
-    # Step 1: NetCDF to HDF5 without compression
-    # '''
-    # nc_file = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/{variable}.nc'
-    # hdf5_file = os.path.join(output_path, f'{variable}.hdf5')
-    # convert_nc_to_hdf5(nc_file, hdf5_file)
+    '''
+    Step 1: NetCDF to HDF5 without compression
+    '''
+    nc_file = f'/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/{variable}.nc'
+    hdf5_file = os.path.join(output_path, f'{variable}.hdf5')
+    convert_nc_to_hdf5(nc_file, hdf5_file)
 
-    # '''
-    # Step 2: Run Lossless Compressors
-    # '''
-    # results = run_lossless_compression(output_path, variable)
-    # results_df = pd.DataFrame(results)
-    # results_df.to_csv(f'./results/{variable}_lossless_compression.csv', index=False)
+    '''
+    Step 2: Run Lossless Compressors
+    '''
+    results = run_lossless_compression(output_path, variable)
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(f'./results/{variable}_lossless_compression.csv', index=False)
 
-    # '''
-    # Step 3: Run EBCC with Uniform Error Bound
-    # '''
-    # ebcc_base_compression_ratio_lst = [1, 10, 100, 1000]
-    # ebcc_max_error_lst = [0.01, 0.1, 1]
+    '''
+    Step 3: Run EBCC with Uniform Error Bound
+    '''
+    ebcc_base_compression_ratio_lst = [1, 10, 100, 1000]
+    ebcc_max_error_lst = [0.01, 0.1, 1]
 
-    # param_combinations = list(itertools.product([output_path], [variable], ebcc_base_compression_ratio_lst, ebcc_max_error_lst))
+    param_combinations = list(itertools.product([output_path], [variable], ebcc_base_compression_ratio_lst, ebcc_max_error_lst))
       
-    # # MP
-    # with mp.Pool(processes=32) as pool:
-    #   results = pool.starmap(run_ebcc_uniform, param_combinations)
+    # MP
+    with mp.Pool(processes=32) as pool:
+      results = pool.starmap(run_ebcc_uniform, param_combinations)
 
-    # # for loop
-    # # results = []
-    # # for params in param_combinations:
-    # #   results.append(run_ebcc_uniform(*params))
+    # for loop
+    # results = []
+    # for params in param_combinations:
+    #   results.append(run_ebcc_uniform(*params))
     
-    # # Convert results to a structured DataFrame
-    # results_df = pd.DataFrame(results)
+    # Convert results to a structured DataFrame
+    results_df = pd.DataFrame(results)
 
-    # results_df.to_csv(f'./results/{variable}_ebcc_uniform_compression.csv', index=False)
+    results_df.to_csv(f'./results/{variable}_ebcc_uniform_compression.csv', index=False)
 
     '''
     Step 4: Plot Compression Error Distribution
     '''
-    ebcc_base_compression_ratio_lst = [1, 10, 100, 1000]
-    ebcc_max_error_lst = [0.01, 0.1, 1]
-    param_combinations = list(itertools.product([output_path], [variable], ebcc_base_compression_ratio_lst, ebcc_max_error_lst))
     for params in param_combinations:
       plot_compression_error_dist(*params)
 

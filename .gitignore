@@ -1,7 +1,7 @@
 __pycache__
 src/build
 src/share
-pyproject.toml
+*.egg-info
 data/test.hdf5
 data/test.pdf
 data/compressed.nc
@@ -9,3 +9,4 @@ data/compressed.nc
 .vscode
 *.nc
 slurm_out/
+results/
