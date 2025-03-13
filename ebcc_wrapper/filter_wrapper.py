@@ -14,18 +14,19 @@ def float_to_uint32(f):
     return struct.unpack('I', packed)[0]
 
 class EBCC_Filter(Mapping):
-    FILTER_ID = 308
 
     def __init__(self, base_cr: float, height: int, width: int, residual_opt: Tuple[str, float], data_dim: int = 2, filter_path: str = None):
         assert height > 0 and width > 0
         base_cr = float(base_cr)
         hdf_filter_opts = [int(height), int(width), float_to_uint32(base_cr)]
+        self.FILTER_ID = 308
         self.base_cr = base_cr
         self.height = height
         self.width = width
         self.residual_opt = residual_opt
         residual_type_str, residual_opt_val = residual_opt
         self.data_dim = data_dim
+        self.chunks = (*[1 for _ in range(self.data_dim - 2)], height, width)
         residual_opt_val = float(residual_opt_val)
         if residual_type_str == "quantile_target":
             residual_type = 1
@@ -40,12 +41,17 @@ class EBCC_Filter(Mapping):
             residual_type = 4
             q_a, q_b = double_to_uint32(residual_opt_val)
             hdf_filter_opts.extend([residual_type, q_a, q_b])
+        elif residual_type_str == "pointwise_max_error":
+            # point-wise max error = error given * ratio, ratio is given in residual_opt_val
+            self.FILTER_ID = 310
+            residual_type = 5
+            hdf_filter_opts.extend([residual_type, float_to_uint32(residual_opt_val)])
+            self.chunks = (*[1 for _ in range(self.data_dim - 3)], 2, height, width)
         else:
             print(f""""Unknown residual_type {residual_type_str}, has to be one of 'quantile_target', 
                   'max_error_target', 'relative_error_target' or 'fixed_sparsification""")
 
         self.hdf_filter_opts = tuple(hdf_filter_opts)
-        self.chunks = (*[1 for _ in range(self.data_dim - 2)], height, width)
         #if filter_path is None:
         #    filter_path = os.path.join(os.path.dirname(__file__), 'src')
         #os.environ["HDF5_PLUGIN_PATH"] = filter_path

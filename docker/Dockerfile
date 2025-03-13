@@ -16,7 +16,8 @@ RUN apt-get update && \
     nano \
     vim \
     wget \
-    curl
+    curl \
+    gdb
 
 RUN pip install packaging
 RUN pip install mmengine-lite==0.10.4 tqdm cdsapi>=0.7.4

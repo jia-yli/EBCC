@@ -1,77 +1,84 @@
 import os
 current_folder = os.path.dirname(os.path.realpath(__file__))
 os.environ["HDF5_PLUGIN_PATH"] = os.path.join(current_folder, '../src/build/lib')
+os.environ["EBCC_LOG_LEVEL"] = 3
 
+import time
 import h5py
+import xarray as xr
 import numpy as np
 from ebcc_wrapper import EBCC_Filter
 
-def compress_hdf5(input_hdf5, output_hdf5):
+def convert_nc_to_hdf5(nc_file, hdf5_file):
   """
-  Reads an HDF5 file and saves it to a new file with a different compression method.
+  Convert a NetCDF (.nc) file to HDF5 (.h5) format.
 
   Parameters:
-    input_hdf5 (str): Path to the original HDF5 file.
-    output_hdf5 (str): Path to the new HDF5 file.
-    compression (str): Compression type ("gzip", "lzf", "szip").
+    nc_file (str): Path to the input NetCDF file.
+    hdf5_file (str): Path to the output HDF5 file.
   """
-  with h5py.File(input_hdf5, 'r') as hdf5_in, h5py.File(output_hdf5, 'w') as hdf5_out:
-    for var_name in hdf5_in.keys():
-      data = np.array(hdf5_in[var_name])  # Read dataset
+  # Open the NetCDF file
+  dataset = xr.open_dataset(nc_file)
 
-      ebcc_filter = EBCC_Filter(
-        base_cr=100, # base compression ratio
-        height=data.shape[-2],  # height of each 2D data chunk
-        width=data.shape[-1],  # width of each 2D data chunk
-        data_dim=len(data.shape), # data dimension, required to specify the HDF5 chunk shape
-        residual_opt=("max_error_target", 1),
-        filter_path=os.path.join(current_folder, 'src')) # directory to the compiled HDF5 filter plugin
+  # Create an HDF5 file
+  with h5py.File(hdf5_file, 'w') as hdf5_f:
+    for var_name, da in dataset.data_vars.items():
+      data = da.values  # Convert xarray DataArray to NumPy array
+      hdf5_f.create_dataset(var_name, data=data)
+    
+    # Save the dimensions as attributes
+    for dim_name, dim_value in dataset.sizes.items():
+      hdf5_f.attrs[dim_name] = dim_value
 
-      print(dict(ebcc_filter))
+    # Save global attributes
+    for attr_name, attr_value in dataset.attrs.items():
+      hdf5_f.attrs[attr_name] = str(attr_value)  # Convert to string to store in HDF5
 
-      # Save dataset with new compression
-      # hdf5_out.create_dataset(var_name, data=data, **ebcc_filter)
-      hdf5_out.create_dataset(var_name, data=data, compression='gzip')
+def compress_hdf5_ebcc_uniform(input_hdf5, output_hdf5, ebcc_base_compression_ratio, ebcc_max_error):
+  # compression and compression time
+  with h5py.File(input_hdf5, 'r') as hdf5_in:
+    compression_start_time = time.time()
+    with h5py.File(output_hdf5, 'w') as hdf5_out:
+      for var_name in hdf5_in.keys():
+        data = np.array(hdf5_in[var_name])  # Read dataset
+        ebcc_filter = EBCC_Filter(
+          base_cr=ebcc_base_compression_ratio, # base compression ratio
+          height=data.shape[-2],  # height of each 2D data chunk
+          width=data.shape[-1],  # width of each 2D data chunk
+          data_dim=len(data.shape), # data dimension, required to specify the HDF5 chunk shape
+          residual_opt=("max_error_target", ebcc_max_error),
+          filter_path=os.path.join(current_folder, '../src')) # directory to the compiled HDF5 filter plugin
+        hdf5_out.create_dataset(var_name, data=data, **ebcc_filter)
 
-    # Copy attributes
-    for attr_name, attr_value in hdf5_in.attrs.items():
-      hdf5_out.attrs[attr_name] = attr_value
+      # Copy attributes
+      for attr_name, attr_value in hdf5_in.attrs.items():
+        hdf5_out.attrs[attr_name] = attr_value
+    compression_end_time = time.time()
+    compression_time = compression_end_time - compression_start_time
 
-def compute_compression_error(original_hdf5, compressed_hdf5):
-  """
-  Computes the point-wise error and maximum error between the original HDF5 file and the lossy-compressed HDF5 file.
-  
-  Parameters:
-    original_hdf5 (str): Path to the original HDF5 file.
-    compressed_hdf5 (str): Path to the lossy-compressed HDF5 file.
-  """
-
-  max_error = {}
-  # Open HDF5 files
-  with h5py.File(original_hdf5, 'r') as orig_file, h5py.File(compressed_hdf5, 'r') as comp_file:
-    for dataset_name in orig_file.keys():
-      orig_data = np.array(orig_file[dataset_name])
-      comp_data = np.array(comp_file[dataset_name])
-
-      # Compute absolute difference (point-wise error)
-      error = np.abs(orig_data - comp_data)
-
-      # Max absolute error
-      dataset_max_error = np.max(error)
-      max_error[dataset_name] = dataset_max_error
-
-  for dataset_name in max_error.keys():
-    print(f"Dataset: {dataset_name} | Max Error: {max_error[dataset_name]:.6f}")
-
+  # decompreession time
+  decompression_start_time = time.time()
+  with h5py.File(output_hdf5, 'r') as hdf5_out:
+    for dataset_name in hdf5_out.keys():
+      data = np.array(hdf5_out[dataset_name])
+  decompression_end_time = time.time()
+  decompression_time = decompression_end_time - decompression_start_time
+  return compression_time, decompression_time
 
 
-input_hdf5_file_path = "/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/2m_temperature.hdf5"  # Replace with your desired output file path
-output_hdf5_file_path = "/capstor/scratch/cscs/ljiayong/datasets/ERA5/reanalysis/2m_temperature_ebcc.hdf5"  # Replace with your desired output file path
-compress_hdf5(input_hdf5_file_path, output_hdf5_file_path)
+output_path = f'/capstor/scratch/cscs/ljiayong/workspace/EBCC'
+variable = total_precipitation
+
+ebcc_base_compression_ratio = 1000
+ebcc_max_error = 1
+
+input_hdf5_file_path = os.path.join(output_path, f'{variable}.hdf5')
+output_hdf5_file_path = os.path.join(output_path, f'{variable}_compressed_ebcc_uniform_test.hdf5')
+compression_time, decompression_time = compress_hdf5_ebcc_uniform(input_hdf5_file_path, output_hdf5_file_path, ebcc_base_compression_ratio, ebcc_max_error)
+
+print(f"Compression Time: {compression_time} s, Decompression Time: {decompression_time} s")
 
 input_size = os.path.getsize(input_hdf5_file_path)
 output_size = os.path.getsize(output_hdf5_file_path)
 
 print(f"File Sizes:\nInput: {input_size/1024/1024/1024:.4f} GiB\nOutput: {output_size/1024/1024/1024:.4f} GiB\n")
-
-compute_compression_error(input_hdf5_file_path, output_hdf5_file_path)

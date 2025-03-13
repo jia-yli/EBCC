@@ -1,5 +1,6 @@
 #include <H5PLextern.h>
 #include <unistd.h>
+#include "log.h"
 #include "j2k_codec.h"
 
 #define H5Z_FILTER_J2K 308
@@ -72,6 +73,10 @@ void populate_config(codec_config_t *config, size_t cd_nelmts, const unsigned in
         case QUANTILE:
             assert(cd_nelmts == 6);
             config->quantile = uint_ptr_to_double(&cd_values[4]);
+            break;
+        default:
+            // Unsupported residual_compression_type
+            assert(false);
             break;
     }
 }

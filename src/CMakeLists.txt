@@ -15,7 +15,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE True)
 
 
 add_library(h5z_j2k SHARED h5z_j2k.c spiht/spiht_re.c log/log.c)
+add_library(h5z_j2k_pointwise SHARED h5z_j2k_pointwise.c spiht/spiht_re.c log/log.c)
 set_property(TARGET h5z_j2k PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+set_property(TARGET h5z_j2k_pointwise PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 option(ZSTD_BUILD_PROGRAMS "" OFF)
 option(BUILD_CODEC "Build OPENJPEG CLI APPS" OFF)
@@ -26,8 +28,9 @@ find_package(HDF5 REQUIRED)
 
 include_directories(${HDF5_INCLUDE_DIRS} ${CMAKE_CURRENT_BINARY_DIR}/hdf5/src build/hdf5/src zstd/lib openjpeg/src/lib/openjp2 build/openjpeg/src/lib/openjp2 spiht log)
 target_link_libraries(h5z_j2k PRIVATE libzstd_static openjp2_static ${HDF5_LIBRARIES})
+target_link_libraries(h5z_j2k_pointwise PRIVATE libzstd_static openjp2_static ${HDF5_LIBRARIES})
 
 install(
-    TARGETS h5z_j2k
+    TARGETS h5z_j2k h5z_j2k_pointwise
     LIBRARY DESTINATION lib
 )
