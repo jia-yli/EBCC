@@ -802,6 +802,10 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
 
     log_trace("minval: %f, maxval: %f", minval, maxval);
 
+    float error_bound_minval, error_bound_maxval;
+    findMinMaxf(error_bound, tot_size, &error_bound_minval, &error_bound_maxval);
+    log_trace("error_bound minval: %f, error_bound maxval: %f", error_bound_minval, error_bound_maxval);
+
     uint16_t *scaled_data;
 
     if (!const_field) {
@@ -846,18 +850,20 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
         for (size_t i = 0; i < tot_size; ++i) {
             residual[i] = data[i] - decoded[i];
         }
-        size_t large_error_count = 0;
-        for (size_t i = 0; i < tot_size; ++i) {
-            if (fabsf(residual[i]) > error_target[i]) {
-                large_error_count += 1;
-            }
-        }
         findMinMaxf(residual, tot_size, &residual_minval, &residual_maxval);
 
-        int skip_residual = large_error_count == 0;
+        float cur_max_error_diff = -INFINITY;
+        float best_feasible_max_error_diff = -INFINITY;
+        for (size_t i = 0; i < tot_size; ++i) {
+            float error_diff = fabsf(residual[i]) - error_target[i];
+            if (error_diff > cur_max_error_diff) {
+                cur_max_error_diff = error_diff;
+            }
+        }
+        int skip_residual = cur_max_error_diff <= 0;
         pure_j2k_done = base_quantile_target == 1.0;
 
-        log_info("large_error_count: %d, residual_minval: %f, residual_maxval: %f", (int) large_error_count, residual_minval, residual_maxval);
+        log_info("cur_max_error_diff: %f, residual_minval: %f, residual_maxval: %f", cur_max_error_diff, residual_minval, residual_maxval);
 
         if (pure_j2k_done) log_info("Pure JP2 compression is feasible, cr: %f", current_cr);
         if (skip_residual) log_info("Skip Residual 1");
@@ -881,18 +887,20 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
                 residual[i] = residual_norm[i] * (residual_maxval - residual_minval) + residual_minval;
             }
             // is current compression good enough
-            size_t large_error_count = 0;
+            cur_max_error_diff = -INFINITY;
             for (size_t i = 0; i < tot_size; ++i) {
-                if (fabsf(data[i] - decoded[i] - residual[i]) > error_target[i]) {
-                    large_error_count += 1;
+                float error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
+                if (error_diff > cur_max_error_diff) {
+                    cur_max_error_diff = error_diff;
                 }
             }
-            log_info("large_error_count: %d", large_error_count);
-            if (large_error_count != 0) {
+            if (cur_max_error_diff > 0) {
                 log_warn("Could not reach error target. Retry with pure base compression.");
                 skip_residual = TRUE;
                 pure_j2k_required = TRUE;
                 /*DONE: if this happen, go for full jpeg2000*/
+            } else {
+                best_feasible_max_error_diff = cur_max_error_diff;
             }
         }
         if (skip_residual) log_info("Skip Residual 2");
@@ -907,56 +915,29 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
             
             /* TODO: exit after 64 trials or examine initial trunc_hi satisfy the error requirement*/
             best_feasible_trunc = trunc_hi;
-            int is_all_margin_satisfied = 1;
-            float largest_error_diff = 0;
-            for (size_t i = 0; i < tot_size; ++i) {
-                if ((error_target[i] - fabsf(data[i] - decoded[i] - residual[i])) <= eps*error_target[i]) {
-                    is_all_margin_satisfied = 0;
-                }
-                float error_diff = 0;
-                if (fabsf(data[i] - decoded[i] - residual[i]) > (error_target[i]*(1-eps))) {
-                    error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
-                }
-                if (error_diff > largest_error_diff) {
-                    largest_error_diff = error_diff;
-                }
-            }
-            while ((is_all_margin_satisfied) && (trunc_hi - trunc_lo > 8 * 4)) {
+            while ((best_feasible_max_error_diff < -eps) && (trunc_hi - trunc_lo > 8 * 4)) {
                 coeffs_trunc_bits = ((size_t) ceill((trunc_hi + trunc_lo) / 2 / 8)) * 8; /* ceil to bytes*/
                 spiht_decode(coeffs_buf, coeffs_trunc_bits / 8, residual_norm, image_dims[0], image_dims[1], coeffs_trunc_bits);
                 for (size_t i = 0; i < tot_size; ++i) {
                     residual[i] = residual_norm[i] * (residual_maxval - residual_minval) + residual_minval;
                 }
-                size_t large_error_count = 0;
+                cur_max_error_diff = -INFINITY;
                 for (size_t i = 0; i < tot_size; ++i) {
-                    if (fabsf(data[i] - decoded[i] - residual[i]) > error_target[i]) {
-                        large_error_count += 1;
+                    float error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
+                    if (error_diff > cur_max_error_diff) {
+                        cur_max_error_diff = error_diff;
                     }
                 }
-                is_all_margin_satisfied = 1;
-                float current_largest_error_diff = 0;
-                for (size_t i = 0; i < tot_size; ++i) {
-                    if ((error_target[i] - fabsf(data[i] - decoded[i] - residual[i])) <= (eps*error_target[i])) {
-                        is_all_margin_satisfied = 0;
-                    }
-                    float error_diff = 0;
-                    if (fabsf(data[i] - decoded[i] - residual[i]) > error_target[i]) {
-                        error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
-                    }
-                    if (error_diff > current_largest_error_diff) {
-                        current_largest_error_diff = error_diff;
-                    }
-                }
-                if (large_error_count != 0) {
+                if (cur_max_error_diff > 0) {
                     trunc_lo = coeffs_trunc_bits;
                 } else {
                     trunc_hi = coeffs_trunc_bits;
-                    if (current_largest_error_diff >= largest_error_diff) {
-                        largest_error_diff = current_largest_error_diff;
+                    if (cur_max_error_diff >= best_feasible_max_error_diff) {
+                        best_feasible_max_error_diff = cur_max_error_diff;
                         best_feasible_trunc = coeffs_trunc_bits;
                     }
                 }
-                log_trace("trunc_lo: %.1f, trunc_hi: %.1f, coeffs_trunc_bytes: %lu, current_largest_error_diff: %f", trunc_lo, trunc_hi, coeffs_trunc_bits / 8, current_largest_error_diff);
+                log_trace("trunc_lo: %.1f, trunc_hi: %.1f, coeffs_trunc_bytes: %lu, cur_max_error_diff: %f", trunc_lo, trunc_hi, coeffs_trunc_bits / 8, cur_max_error_diff);
             }
             coeffs_size = (size_t) (best_feasible_trunc / 8.);
 #ifdef DEBUG

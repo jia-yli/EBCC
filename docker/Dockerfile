@@ -21,7 +21,7 @@ RUN apt-get update && \
 
 RUN pip install packaging
 RUN pip install mmengine-lite==0.10.4 tqdm cdsapi>=0.7.4
-RUN pip install netCDF4 xarray cartopy h5py
+RUN pip install netCDF4 xarray cartopy h5py scipy bottleneck
 RUN pip install matplotlib
 
 ENTRYPOINT /bin/bash
