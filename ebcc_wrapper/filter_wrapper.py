@@ -1,6 +1,9 @@
+import os
+current_folder = os.path.dirname(os.path.realpath(__file__))
+os.environ["HDF5_PLUGIN_PATH"] = os.path.join(current_folder, '../src/build/lib')
+
 import argparse
 import struct
-import os
 import sys
 from typing import Tuple
 from collections.abc import Mapping

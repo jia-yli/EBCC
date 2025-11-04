@@ -253,7 +253,7 @@ float get_max_relative_error(const float *data, const float *decoded, const floa
     assert(tot_size > 0);
     for (size_t i = 0; i < tot_size; ++i) {
         float residual_value = residual ? residual[i] : 0;
-        float cur_error = fabsf(data[i] - decoded[i] - residual_value) / data_range;
+        float cur_error = fabsf(data[i] - (decoded[i] + residual_value)) / data_range;
         if (cur_error > cur_max_error) {
             cur_max_error = cur_error;
         }
@@ -265,7 +265,7 @@ float get_max_error(const float *data, const float *decoded, const float *residu
     float cur_max_error = 0;
     for (size_t i = 0; i < tot_size; ++i) {
         float residual_value = residual ? residual[i] : 0;
-        float cur_error = fabsf(data[i] - decoded[i] - residual_value);
+        float cur_error = fabsf(data[i] - (decoded[i] + residual_value));
         /* this is pointwise relative error
         if (error_type == RELATIVE_ERROR) {
             cur_error /= fabsf(data[i]);
@@ -282,7 +282,7 @@ double get_error_target_quantile(const float *data, const float *decoded, const 
     size_t n = 0;
     for (size_t i = 0; i < tot_size; ++i) {
         float residual_value = residual ? residual[i] : 0;
-        float cur_error = fabsf(data[i] - decoded[i] - residual_value);
+        float cur_error = fabsf(data[i] - (decoded[i] + residual_value));
         if (cur_error > error_target) {
             n++;
         }
@@ -294,7 +294,7 @@ double get_error_target_quantile_pointwise(const float *data, const float *decod
     size_t n = 0;
     for (size_t i = 0; i < tot_size; ++i) {
         float residual_value = residual ? residual[i] : 0;
-        float cur_error = fabsf(data[i] - decoded[i] - residual_value);
+        float cur_error = fabsf(data[i] - (decoded[i] + residual_value));
         if (cur_error > error_target[i]) {
             n++;
         }
@@ -841,7 +841,7 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
 
         float *error_target = (float *) malloc(tot_size * sizeof(float));
         for (size_t i = 0; i < tot_size; ++i) {
-            error_target[i] = error_bound[i] * (config->pointwise_max_error_ratio);
+            error_target[i] = error_bound[i] * (config->pointwise_max_error_ratio) * (1-eps);
         }
         current_cr = config->base_cr;
 
@@ -889,7 +889,7 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
             // is current compression good enough
             cur_max_error_diff = -INFINITY;
             for (size_t i = 0; i < tot_size; ++i) {
-                float error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
+                float error_diff = fabsf(data[i] - (decoded[i] + residual[i])) - error_target[i];
                 if (error_diff > cur_max_error_diff) {
                     cur_max_error_diff = error_diff;
                 }
@@ -915,7 +915,7 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
             
             /* TODO: exit after 64 trials or examine initial trunc_hi satisfy the error requirement*/
             best_feasible_trunc = trunc_hi;
-            while ((best_feasible_max_error_diff < -eps) && (trunc_hi - trunc_lo > 8 * 4)) {
+            while ((best_feasible_max_error_diff < 0) && (trunc_hi - trunc_lo > 8 * 4)) {
                 coeffs_trunc_bits = ((size_t) ceill((trunc_hi + trunc_lo) / 2 / 8)) * 8; /* ceil to bytes*/
                 spiht_decode(coeffs_buf, coeffs_trunc_bits / 8, residual_norm, image_dims[0], image_dims[1], coeffs_trunc_bits);
                 for (size_t i = 0; i < tot_size; ++i) {
@@ -923,7 +923,7 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
                 }
                 cur_max_error_diff = -INFINITY;
                 for (size_t i = 0; i < tot_size; ++i) {
-                    float error_diff = fabsf(data[i] - decoded[i] - residual[i]) - error_target[i];
+                    float error_diff = fabsf(data[i] - (decoded[i] + residual[i])) - error_target[i];
                     if (error_diff > cur_max_error_diff) {
                         cur_max_error_diff = error_diff;
                     }
@@ -937,6 +937,9 @@ size_t encode_climate_variable_pointwise(float *data, float *error_bound, codec_
                         best_feasible_trunc = coeffs_trunc_bits;
                     }
                 }
+
+                // log_trace("best_feasible_max_error_diff: %f, cur_max_error_diff: %f, best_feasible_trunc: %f", best_feasible_max_error_diff, cur_max_error_diff, best_feasible_trunc);
+                // log_trace("data: %f, decoded: %f, residual: %f, error_target: %f", data[895974], decoded[895974], residual[895974], error_target[895974]);
                 log_trace("trunc_lo: %.1f, trunc_hi: %.1f, coeffs_trunc_bytes: %lu, cur_max_error_diff: %f", trunc_lo, trunc_hi, coeffs_trunc_bits / 8, cur_max_error_diff);
             }
             coeffs_size = (size_t) (best_feasible_trunc / 8.);
