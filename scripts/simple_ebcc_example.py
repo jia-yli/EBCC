@@ -8,9 +8,6 @@ import xarray as xr
 import sys
 import os
 
-# Add path to import wrapper
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-
 from ebcc_wrapper import EBCCDirectWrapper
 
 # ERA5 data configuration
