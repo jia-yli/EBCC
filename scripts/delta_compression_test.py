@@ -11,6 +11,17 @@ import os
 from ebcc_wrapper.delta_compression import PressureLevelDeltaCompressor
 from ebcc_wrapper import EBCCDirectWrapper
 
+
+def _compress_level_worker(level, data, error_bound, ratio):
+    """Worker function for parallel compression - must be at module level for pickling."""
+    compressor = EBCCDirectWrapper()
+    compressed = compressor.compress(data, error_bound, ratio=ratio)
+    decompressed = compressor.decompress(compressed)
+    errors = np.abs(decompressed - data)
+    violations = np.sum(errors > error_bound * ratio)
+    return level, compressed, violations == 0, data.nbytes, len(compressed)
+
+
 def main():
     # ERA5 data configuration
     era5_path = '/capstor/scratch/cscs/ljiayong/datasets/ERA5_large'
@@ -19,7 +30,22 @@ def main():
     variable = 'temperature'
     
     # Pressure levels to test (ordered from high to low pressure)
-    test_pressure_levels = ["1000", "950", "900", "850", "800", "750", "700", "650", "600", "550", "500"]
+    # test_pressure_levels = ["1000", "950", "900", "850", "800", "750", "700", "650", "600", "550", "500"]
+    test_pressure_levels = [
+        "1",  "2", "3", 
+        "5", "7", "10",
+        "20", "30", "50",
+        "70", "100", "125",
+        "150", "175", "200",
+        "225", "250", "300",
+        "350", "400", "450",
+        "500", "550", "600",
+        "650", "700", "750",
+        "775", "800", "825",
+        "850", "875", "900",
+        "925", "950", "975",
+        "1000"
+    ]
     
     print(f"ERA5 Delta Compression Test")
     print(f"Variable: {variable}, Year: {year}, Month: {month}")
@@ -32,8 +58,10 @@ def main():
     
     # Load data for all pressure levels
     print("Loading pressure level data...")
+    steps = 8  # Only compress first 8 time steps for faster testing
+    max_workers = 32
     data_dict, error_bound_dict = delta_compressor.load_pressure_level_data(
-        era5_path, year, month, variable, test_pressure_levels, steps=8, max_workers=64
+        era5_path, year, month, variable, test_pressure_levels, steps=steps, max_workers=max_workers
     )
     
     if not data_dict:
@@ -48,45 +76,43 @@ def main():
     # Test parameters
     ratio = 1.0
     
-    # Standard compression (baseline)
+    # Standard compression (baseline) - using multiprocessing
     print("\n" + "-" * 60)
     print("STANDARD COMPRESSION (Baseline)")
     print("-" * 60)
+    
+    from concurrent.futures import ProcessPoolExecutor, as_completed
     
     standard_compressed = {}
     standard_total_original = 0
     standard_total_compressed = 0
     standard_error_check = True
     
-    for pressure_level in test_pressure_levels:
-        if pressure_level not in data_dict:
-            continue
-            
-        data = data_dict[pressure_level]
-        error_bound = error_bound_dict[pressure_level]
+    results = []
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_compress_level_worker, level, data_dict[level], 
+                                   error_bound_dict[level], ratio): level 
+                  for level in test_pressure_levels if level in data_dict}
         
-        # Compress and decompress
-        compressed = standard_compressor.compress(data, error_bound, ratio=ratio)
-        decompressed = standard_compressor.decompress(compressed)
-        
-        # Check error bounds
-        errors = np.abs(decompressed - data)
-        violations = np.sum(errors > error_bound * ratio)
-        level_check = violations == 0
-        standard_error_check = standard_error_check and level_check
-        
-        standard_compressed[pressure_level] = compressed
-        
-        original_size = data.nbytes
-        compressed_size = len(compressed)
-        compression_ratio = original_size / compressed_size
-        
-        standard_total_original += original_size
-        standard_total_compressed += compressed_size
-        
-        print(f"{pressure_level:>4} hPa: {compression_ratio:6.2f}x "
-              f"({original_size:,} -> {compressed_size:,} bytes) "
-              f"{'✓' if level_check else '✗'} ({violations} violations)")
+        for future in as_completed(futures):
+            level, compressed, level_check, original_size, compressed_size = future.result()
+            standard_compressed[level] = compressed
+            standard_error_check = standard_error_check and level_check
+            standard_total_original += original_size
+            standard_total_compressed += compressed_size
+            results.append((level, level_check, original_size, compressed_size))
+    
+    # Print results in order
+    for level in test_pressure_levels:
+        if level in standard_compressed:
+            level_info = next((r for r in results if r[0] == level), None)
+            if level_info:
+                _, level_check, original_size, compressed_size = level_info
+                compression_ratio = original_size / compressed_size
+                violations = 0 if level_check else 1
+                print(f"{level:>4} hPa: {compression_ratio:6.2f}x "
+                      f"({original_size:,} -> {compressed_size:,} bytes) "
+                      f"{'✓' if level_check else '✗'} ({violations} violations)")
     
     standard_overall_ratio = standard_total_original / standard_total_compressed
     
