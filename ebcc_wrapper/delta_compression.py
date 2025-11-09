@@ -6,6 +6,8 @@ Exploits correlation between adjacent pressure levels to improve compression eff
 
 import numpy as np
 import xarray as xr
+import zlib
+import pickle
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .direct_wrapper import EBCCDirectWrapper
@@ -197,35 +199,29 @@ class PressureLevelDeltaCompressor:
                 # Compress first level normally (reference level)
                 compressed = self.compressor.compress(data, error_bound, ratio=ratio)
                 compressed_dict[pressure_level] = compressed
+                cr = data.nbytes / len(compressed)
+                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed):,} bytes) [DIRECT]")
             else:
-                # Delta compression for subsequent levels
+                # Try both delta and direct compression, choose smaller
                 prev_pressure_level = pressure_levels[i-1]
-                if prev_pressure_level not in data_dict:
-                    # Fall back to normal compression if previous level not available
-                    compressed = self.compressor.compress(data, error_bound, ratio=ratio)
-                    compressed_dict[pressure_level] = compressed
-                    continue
                 
                 prev_data = data_dict[prev_pressure_level]
-                
-                # Compute prediction (simple: use previous level)
-                prediction = self.compute_prediction(
-                    prev_data, pressure_values[i], pressure_values[i-1]
-                )
-                
-                # Compute delta (residual)
+                prediction = self.compute_prediction(prev_data, pressure_values[i], pressure_values[i-1])
                 delta = data - prediction
                 
-                # For delta compression, we need to ensure that:
-                # |reconstructed - original| <= original_error_bound
-                # Since reconstructed = prediction + compressed_delta
-                # We need: |prediction + compressed_delta - original| <= original_error_bound
-                # This means: |compressed_delta - delta| <= original_error_bound
-                # So we use the original error bound for delta compression
-                
-                # Compress delta using original error bounds
+                # Compress both delta and direct
                 compressed_delta = self.compressor.compress(delta, error_bound, ratio=ratio)
-                compressed_dict[pressure_level] = compressed_delta
+                compressed_direct = self.compressor.compress(data, error_bound, ratio=ratio)
+                
+                # Choose smaller, store flag
+                if len(compressed_delta) < len(compressed_direct):
+                    compressed_dict[pressure_level] = b'DELTA' + compressed_delta
+                    cr = data.nbytes / len(compressed_delta)
+                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_delta):,} bytes) [DELTA]")
+                else:
+                    compressed_dict[pressure_level] = b'DIRECT' + compressed_direct
+                    cr = data.nbytes / len(compressed_direct)
+                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_direct):,} bytes) [DIRECT]")
                 
         return compressed_dict
     
@@ -248,32 +244,23 @@ class PressureLevelDeltaCompressor:
             if pressure_level not in compressed_dict:
                 continue
                 
-            if i == 0:
-                # Decompress reference level normally
-                decompressed = self.compressor.decompress(compressed_dict[pressure_level])
-                decompressed_dict[pressure_level] = decompressed
-            else:
+            compressed = compressed_dict[pressure_level]
+            
+            if i == 0 or compressed.startswith(b'DIRECT'):
+                # Direct decompression
+                bitstream = compressed[6:] if compressed.startswith(b'DIRECT') else compressed
+                decompressed_dict[pressure_level] = self.compressor.decompress(bitstream)
+            elif compressed.startswith(b'DELTA'):
                 # Delta decompression
                 prev_pressure_level = pressure_levels[i-1]
                 if prev_pressure_level not in decompressed_dict:
-                    # Fall back to normal decompression
-                    decompressed = self.compressor.decompress(compressed_dict[pressure_level])
-                    decompressed_dict[pressure_level] = decompressed
+                    decompressed_dict[pressure_level] = self.compressor.decompress(compressed[5:])
                     continue
                 
                 prev_data = decompressed_dict[prev_pressure_level]
-                
-                # Compute same prediction as during compression
-                prediction = self.compute_prediction(
-                    prev_data, pressure_values[i], pressure_values[i-1]
-                )
-                
-                # Decompress delta
-                delta = self.compressor.decompress(compressed_dict[pressure_level])
-                
-                # Reconstruct original data
-                decompressed = prediction + delta
-                decompressed_dict[pressure_level] = decompressed
+                prediction = self.compute_prediction(prev_data, pressure_values[i], pressure_values[i-1])
+                delta = self.compressor.decompress(compressed[5:])
+                decompressed_dict[pressure_level] = prediction + delta
                 
         return decompressed_dict
     
