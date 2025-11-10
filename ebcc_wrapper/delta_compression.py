@@ -330,10 +330,10 @@ class PressureLevelDeltaCompressor:
             if i == 0:
                 # Compress first level normally (reference level)
                 compressed = self.compressor.compress(data, error_bound, ratio=ratio)
-                compressed_dict[pressure_level] = {'method': 'direct', 'data': compressed}
-                cr = data.nbytes / len(compressed)
-                compressed_direct_data = pickle.dumps(compressed)
-                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed):,} bytes {data.nbytes/len(compressed_direct_data):.2f}x) [DIRECT]")
+                compressed_direct_data = pickle.dumps({'method': 'direct', 'data': compressed})
+                compressed_dict[pressure_level] = compressed_direct_data
+                cr = data.nbytes / len(compressed_direct_data)
+                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_direct_data):,} bytes) [DIRECT]")
             else:
                 # Compare three approaches: fail-only, delta+fail, and direct
                 prev_pressure_level = pressure_levels[i-1]
@@ -341,14 +341,8 @@ class PressureLevelDeltaCompressor:
                 prev_data = data_dict[prev_pressure_level]
                 prediction = self.compute_prediction(prev_data, pressure_values[i], pressure_values[i-1])
                 delta = data - prediction
-                
-                # Option 1: Encode fail values only (prediction without compression)
-                # fail_mask_only = np.abs(data - prediction) > error_bound * ratio
-                # fail_idx_only = np.flatnonzero(fail_mask_only).astype(np.int32)
-                # fail_val_only = data.flat[fail_idx_only].astype(np.float32) if fail_idx_only.size else np.array([], dtype=np.float32)
-                # fail_bytes_only = self._encode_fail_values(fail_mask_only, fail_idx_only, fail_val_only)
-                
-                # Option 2: Compress delta directly + fail values
+
+                # Option 1: Compress delta directly + fail values
                 compressed_delta_direct = self.compressor.compress(delta, error_bound, ratio=ratio)
                 decompressed_delta_direct = self.compressor.decompress(compressed_delta_direct)
                 reconstructed_direct = prediction + decompressed_delta_direct
@@ -362,39 +356,31 @@ class PressureLevelDeltaCompressor:
                 else:
                     delta_with_fail_data = {'method': 'delta', 'delta': compressed_delta_direct}
 
-                compressed_dict[pressure_level] = delta_with_fail_data
-                compressed_delta_with_fail = pickle.dumps(delta_with_fail_data) 
-                cr = data.nbytes / len(compressed_delta_with_fail)
-                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_delta_with_fail):,} bytes {data.nbytes/len(compressed_delta_with_fail):.2f}x) [DELTA]")
-
-                # Option 3: Direct compression
-                # compressed_direct = self.compressor.compress(data, error_bound, ratio=ratio)
+                compressed_delta_with_fail = pickle.dumps(delta_with_fail_data)
                 
-                # # Compare all three and select shortest
-                # sizes = {
-                #     'fail-only': len(fail_bytes_only),
-                #     'delta+fail': len(compressed_delta_with_fail),
-                #     'direct': len(compressed_direct)
-                # }
+                # Option 2: Direct compression
+                compressed_direct = self.compressor.compress(data, error_bound, ratio=ratio)
+                direct_data = {'method': 'direct', 'data': compressed_direct}
+                compressed_direct_bytes = pickle.dumps(direct_data)
                 
-                # print(f"Comparing: fail-only={sizes['fail-only']:,}, delta+fail={sizes['delta+fail']:,}, direct={sizes['direct']:,}")
+                # Compare delta+fail vs direct and select the smaller one
+                delta_size = len(compressed_delta_with_fail)
+                direct_size = len(compressed_direct_bytes)
                 
-                # best_method = min(sizes, key=sizes.get)
+                if delta_size <= direct_size:
+                    # Use delta compression
+                    compressed_dict[pressure_level] = compressed_delta_with_fail
+                    cr = data.nbytes / delta_size
+                    fail_ratio = fail_idx_delta.size / data.size if data.size > 0 else 0
+                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {delta_size:,} bytes) "
+                          f"[DELTA] fail_ratio={fail_ratio:.4f} ({fail_idx_delta.size}/{data.size})")
+                else:
+                    # Use direct compression
+                    compressed_dict[pressure_level] = compressed_direct_bytes
+                    cr = data.nbytes / direct_size
+                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {direct_size:,} bytes) "
+                          f"[DIRECT] (delta would be {delta_size:,} bytes)")
                 
-                # if best_method == 'fail-only':
-                #     # Pack fail-only data
-                #     fail_only_data = pickle.dumps({'fail': fail_bytes_only})
-                #     compressed_dict[pressure_level] = b'DELTA' + fail_only_data
-                #     cr = data.nbytes / len(fail_only_data)
-                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(fail_only_data):,} bytes) [DELTA-FAILONLY]")
-                # elif best_method == 'delta+fail':
-                #     compressed_dict[pressure_level] = b'DELTA' + compressed_delta_with_fail
-                #     cr = data.nbytes / sizes['delta+fail']
-                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {sizes['delta+fail']:,} bytes) [DELTA]")
-                # else:
-                #     compressed_dict[pressure_level] = b'DIRECT' + compressed_direct
-                #     cr = data.nbytes / sizes['direct']
-                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {sizes['direct']:,} bytes) [DIRECT]")
         
         elapsed_time = time.time() - start_time
         throughput = total_bytes / elapsed_time / (1024**2)  # MB/s
@@ -421,9 +407,9 @@ class PressureLevelDeltaCompressor:
         for i, pressure_level in enumerate(pressure_levels):
             if pressure_level not in compressed_dict:
                 continue
-                
-            compressed = compressed_dict[pressure_level]
-            
+
+            compressed = pickle.loads(compressed_dict[pressure_level])
+
             if compressed['method'] == 'direct':
                 # Direct decompression
                 decompressed_dict[pressure_level] = self.compressor.decompress(compressed['data'])

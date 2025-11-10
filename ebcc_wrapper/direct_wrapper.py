@@ -89,9 +89,11 @@ class EBCCDirectWrapper:
                     fail_info = pickle.dumps({'mask': cmask, 'val': cval})
                 else:
                     fail_info = pickle.dumps({'idx': cidx, 'val': cval})
-                compressed_bytes += b'EBCCFAIL' + fail_info
+                result = {'data': compressed_bytes, 'fail': fail_info}
+            else:
+                result = {'data': compressed_bytes}
         
-        return compressed_bytes
+        return pickle.dumps(result)
     
     def decompress(self, bitstream: bytes) -> np.ndarray:
         """
@@ -104,29 +106,41 @@ class EBCCDirectWrapper:
             Decompressed data array (without error bounds)
         """
         # Check for failing values marker
-        if b'EBCCFAIL' in bitstream:
-            pos = bitstream.index(b'EBCCFAIL')
-            hdf5_bytes = bitstream[:pos]
-            fail_info = pickle.loads(bitstream[pos + 8:])
-            if 'mask' in fail_info:
-                fail_mask = np.unpackbits(np.frombuffer(zlib.decompress(fail_info['mask']), dtype=np.uint8))
-                fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
-            else:
-                fail_idx = np.frombuffer(zlib.decompress(fail_info['idx']), dtype=np.int32)
-                fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
-        else:
-            hdf5_bytes = bitstream
-            fail_idx = fail_val = None
-        
+        # The bitstream may be either:
+        # 1) a pickled dict: {'data': hdf5_bytes, 'fail': pickle.dumps({...})?}
+        # 2) legacy raw-hdf5-bytes + b'EBCCFAIL' + pickle.dumps(fail_info)
+        hdf5_bytes = None
+        fail_info = None
+
+        result = pickle.loads(bitstream)
+        hdf5_bytes = result['data']
+        fail_info = result.get('fail', None)
+
+        # Read HDF5 bytes from a temporary file
         with tempfile.NamedTemporaryFile() as temp_file:
             temp_file.write(hdf5_bytes)
             temp_file.seek(0)
             with h5py.File(temp_file.name, 'r') as hdf5_file:
                 decompressed_data = np.array(hdf5_file['data'])[..., 0, :, :]
-        
-        if fail_val is not None:
-            if 'fail_mask' in locals():
-                fail_idx = np.flatnonzero(fail_mask[:decompressed_data.size])
-            decompressed_data.flat[fail_idx] = fail_val
-        
+
+        # If we have fail information, decompress and apply it
+        if fail_info:
+            fail_info = pickle.loads(fail_info)
+
+            if 'mask' in fail_info:
+                # mask was stored as packbits(bytes) then zlib-compressed
+                mask_bytes = zlib.decompress(fail_info['mask'])
+                mask_bits = np.unpackbits(np.frombuffer(mask_bytes, dtype=np.uint8))
+                # trim to the flattened data size
+                mask_bits = mask_bits[:decompressed_data.size]
+                fail_idx = np.flatnonzero(mask_bits)
+                fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
+            else:
+                fail_idx = np.frombuffer(zlib.decompress(fail_info['idx']), dtype=np.int32)
+                fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
+
+            # Only assign if we actually have indices and values
+            if fail_idx is not None and fail_val is not None and fail_idx.size and fail_val.size:
+                decompressed_data.flat[fail_idx] = fail_val
+
         return decompressed_data
