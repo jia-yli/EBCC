@@ -8,6 +8,7 @@ import numpy as np
 import xarray as xr
 import zlib
 import pickle
+import time
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from .direct_wrapper import EBCCDirectWrapper
@@ -67,6 +68,134 @@ class PressureLevelDeltaCompressor:
         Initialize delta compressor.
         """
         self.compressor = EBCCDirectWrapper()
+    
+    def _encode_fail_values(self, fail_mask: np.ndarray, fail_idx: np.ndarray, 
+                           fail_val: np.ndarray) -> bytes:
+        """
+        Encode fail values into compressed bytes.
+        
+        Args:
+            fail_mask: Boolean mask of failing positions
+            fail_idx: Indices of failing positions
+            fail_val: Values at failing positions
+            
+        Returns:
+            Encoded fail bytes with DELTAFAIL marker, or empty bytes if no fails
+        """
+        cmask = zlib.compress(np.packbits(fail_mask.ravel()).tobytes(), level=6)
+        cidx = zlib.compress(fail_idx.tobytes(), level=6)
+        cval = zlib.compress(fail_val.tobytes(), level=6)
+        
+        if len(cmask) <= len(cidx):
+            fail_info = pickle.dumps({'mask': cmask, 'val': cval, 'len': fail_mask.size})
+        else:
+            fail_info = pickle.dumps({'idx': cidx, 'val': cval})
+        
+        return fail_info
+    
+    def _decode_fail_values(self, fail_info: bytes, data_shape: Tuple[int]) -> np.ndarray:
+        fail_info = pickle.loads(fail_info)
+        if 'mask' in fail_info:
+            fail_mask = np.unpackbits(np.frombuffer(zlib.decompress(fail_info['mask']), dtype=np.uint8))
+            fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
+            fail_idx = np.flatnonzero(fail_mask[:fail_info['len']])
+        else:
+            fail_idx = np.frombuffer(zlib.decompress(fail_info['idx']), dtype=np.int32)
+            fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
+        
+        return fail_idx, fail_val
+    
+    # def _binary_search_optimal_error_bound(self, delta: np.ndarray, prediction: np.ndarray,
+    #                                       data: np.ndarray, error_bound: np.ndarray,
+    #                                       ratio: float) -> Tuple[bytes, bytes, float]:
+    #     """
+    #     Binary search for optimal constant error bound for delta compression.
+        
+    #     Args:
+    #         delta: Delta values (data - prediction)
+    #         prediction: Predicted values
+    #         data: Original data
+    #         error_bound: Original error bounds
+    #         ratio: Compression ratio parameter
+            
+    #     Returns:
+    #         Tuple of (best_compressed_delta, best_fail_bytes, best_error_bound)
+    #     """
+    #     # Start from RMSE of delta
+    #     rmse = np.sqrt(np.mean(delta**2))
+        
+    #     print(f"    Starting binary search from RMSE={rmse:.4f}")
+        
+    #     # Try compressing delta with constant error bound at RMSE
+    #     const_error_bound = np.full_like(delta, rmse)
+    #     compressed_delta_base = self.compressor.compress(delta, const_error_bound, ratio=ratio)
+    #     decompressed_delta = self.compressor.decompress(compressed_delta_base)
+    #     reconstructed = prediction + decompressed_delta
+        
+    #     # Find fail values where reconstructed exceeds original error bound
+    #     fail_mask = np.abs(data - reconstructed) > error_bound * ratio
+    #     fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
+    #     fail_val = data.flat[fail_idx].astype(np.float32) if fail_idx.size else np.array([], dtype=np.float32)
+        
+    #     fail_bytes = self._encode_fail_values(fail_mask, fail_idx, fail_val)
+        
+    #     current_length = len(compressed_delta_base) + len(fail_bytes)
+    #     best_length = current_length
+    #     best_error_bound = rmse
+    #     best_compressed = compressed_delta_base
+    #     best_fail_bytes = fail_bytes
+        
+    #     # Binary search: try halving error bound
+    #     test_eb = rmse / 2
+    #     while test_eb > 0:
+    #         const_eb = np.full_like(delta, test_eb)
+    #         comp_delta = self.compressor.compress(delta, const_eb, ratio=ratio)
+    #         dec_delta = self.compressor.decompress(comp_delta)
+    #         recon = prediction + dec_delta
+            
+    #         fmask = np.abs(data - recon) > error_bound * ratio
+    #         fidx = np.flatnonzero(fmask).astype(np.int32)
+    #         fval = data.flat[fidx].astype(np.float32) if fidx.size else np.array([], dtype=np.float32)
+            
+    #         fbytes = self._encode_fail_values(fmask, fidx, fval)
+            
+    #         test_length = len(comp_delta) + len(fbytes)
+    #         if test_length < best_length:
+    #             best_length = test_length
+    #             best_error_bound = test_eb
+    #             best_compressed = comp_delta
+    #             best_fail_bytes = fbytes
+    #             test_eb /= 2
+    #         else:
+    #             break
+        
+    #     # Binary search: try doubling error bound
+    #     test_eb = rmse * 2
+    #     for _ in range(10):  # Limit iterations
+    #         const_eb = np.full_like(delta, test_eb)
+    #         comp_delta = self.compressor.compress(delta, const_eb, ratio=ratio)
+    #         dec_delta = self.compressor.decompress(comp_delta)
+    #         recon = prediction + dec_delta
+            
+    #         fmask = np.abs(data - recon) > error_bound * ratio
+    #         fidx = np.flatnonzero(fmask).astype(np.int32)
+    #         fval = data.flat[fidx].astype(np.float32) if fidx.size else np.array([], dtype=np.float32)
+            
+    #         fbytes = self._encode_fail_values(fmask, fidx, fval)
+            
+    #         test_length = len(comp_delta) + len(fbytes)
+    #         if test_length < best_length:
+    #             best_length = test_length
+    #             best_error_bound = test_eb
+    #             best_compressed = comp_delta
+    #             best_fail_bytes = fbytes
+    #             test_eb *= 2
+    #         else:
+    #             break
+        
+    #     print(f"    Binary search result: eb={best_error_bound:.4f}, size={best_length:,} bytes")
+        
+    #     return best_compressed, best_fail_bytes, best_error_bound
 
     def load_pressure_level_data(self, era5_path: str, year: str, month: str, 
                                 variable: str, pressure_levels: List[str],
@@ -185,8 +314,10 @@ class PressureLevelDeltaCompressor:
         Returns:
             Dictionary of compressed data keyed by pressure level
         """
+        start_time = time.time()
         compressed_dict = {}
         pressure_values = [float(p) for p in pressure_levels]
+        total_bytes = 0
         
         for i, pressure_level in enumerate(pressure_levels):
             if pressure_level not in data_dict:
@@ -194,141 +325,83 @@ class PressureLevelDeltaCompressor:
                 
             data = data_dict[pressure_level]
             error_bound = error_bound_dict[pressure_level]
+            total_bytes += data.nbytes
             
             if i == 0:
                 # Compress first level normally (reference level)
                 compressed = self.compressor.compress(data, error_bound, ratio=ratio)
-                compressed_dict[pressure_level] = compressed
+                compressed_dict[pressure_level] = {'method': 'direct', 'data': compressed}
                 cr = data.nbytes / len(compressed)
-                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed):,} bytes) [DIRECT]")
+                compressed_direct_data = pickle.dumps(compressed)
+                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed):,} bytes {data.nbytes/len(compressed_direct_data):.2f}x) [DIRECT]")
             else:
-                # Try both delta and direct compression, choose smaller
+                # Compare three approaches: fail-only, delta+fail, and direct
                 prev_pressure_level = pressure_levels[i-1]
                 
                 prev_data = data_dict[prev_pressure_level]
                 prediction = self.compute_prediction(prev_data, pressure_values[i], pressure_values[i-1])
                 delta = data - prediction
                 
-                # Binary search for optimal constant error bound for delta
-                # Start from RMSE of delta
-                rmse = np.sqrt(np.mean(delta**2))
-                const_error_bound = np.full_like(delta, rmse)
+                # Option 1: Encode fail values only (prediction without compression)
+                # fail_mask_only = np.abs(data - prediction) > error_bound * ratio
+                # fail_idx_only = np.flatnonzero(fail_mask_only).astype(np.int32)
+                # fail_val_only = data.flat[fail_idx_only].astype(np.float32) if fail_idx_only.size else np.array([], dtype=np.float32)
+                # fail_bytes_only = self._encode_fail_values(fail_mask_only, fail_idx_only, fail_val_only)
                 
-                # Try compressing delta with constant error bound
-                compressed_delta_base = self.compressor.compress(delta, const_error_bound, ratio=ratio)
-                decompressed_delta = self.compressor.decompress(compressed_delta_base)
-                reconstructed = prediction + decompressed_delta
+                # Option 2: Compress delta directly + fail values
+                compressed_delta_direct = self.compressor.compress(delta, error_bound, ratio=ratio)
+                decompressed_delta_direct = self.compressor.decompress(compressed_delta_direct)
+                reconstructed_direct = prediction + decompressed_delta_direct
                 
-                # Find fail values where reconstructed exceeds original error bound
-                fail_mask = np.abs(data - reconstructed) > error_bound * ratio
-                fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
-                fail_val = data.flat[fail_idx].astype(np.float32) if fail_idx.size else np.array([], dtype=np.float32)
-                
-                # Encode fail values
-                if fail_idx.size:
-                    cmask = zlib.compress(np.packbits(fail_mask.ravel()).tobytes(), level=6)
-                    cidx = zlib.compress(fail_idx.tobytes(), level=6)
-                    cval = zlib.compress(fail_val.tobytes(), level=6)
-                    if len(cmask) <= len(cidx):
-                        fail_info = pickle.dumps({'mask': cmask, 'val': cval})
-                    else:
-                        fail_info = pickle.dumps({'idx': cidx, 'val': cval})
-                    fail_bytes = b'DELTAFAIL' + fail_info
+                fail_mask_delta = np.abs(data - reconstructed_direct) > error_bound * ratio
+                fail_idx_delta = np.flatnonzero(fail_mask_delta).astype(np.int32)
+                fail_val_delta = data.flat[fail_idx_delta].astype(np.float32) 
+                if fail_idx_delta.size:
+                    fail_bytes_delta = self._encode_fail_values(fail_mask_delta, fail_idx_delta, fail_val_delta)
+                    delta_with_fail_data = {'method': 'delta', 'delta': compressed_delta_direct, 'fail': fail_bytes_delta}
                 else:
-                    fail_bytes = b''
+                    delta_with_fail_data = {'method': 'delta', 'delta': compressed_delta_direct}
+
+                compressed_dict[pressure_level] = delta_with_fail_data
+                compressed_delta_with_fail = pickle.dumps(delta_with_fail_data) 
+                cr = data.nbytes / len(compressed_delta_with_fail)
+                print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_delta_with_fail):,} bytes {data.nbytes/len(compressed_delta_with_fail):.2f}x) [DELTA]")
+
+                # Option 3: Direct compression
+                # compressed_direct = self.compressor.compress(data, error_bound, ratio=ratio)
                 
-                current_length = len(compressed_delta_base) + len(fail_bytes)
-                best_length = current_length
-                best_error_bound = rmse
-                best_compressed = compressed_delta_base
-                best_fail_bytes = fail_bytes
+                # # Compare all three and select shortest
+                # sizes = {
+                #     'fail-only': len(fail_bytes_only),
+                #     'delta+fail': len(compressed_delta_with_fail),
+                #     'direct': len(compressed_direct)
+                # }
                 
-                # Binary search: try halving error bound
-                test_eb = rmse / 2
-                while test_eb > 0:
-                    const_eb = np.full_like(delta, test_eb)
-                    comp_delta = self.compressor.compress(delta, const_eb, ratio=ratio)
-                    dec_delta = self.compressor.decompress(comp_delta)
-                    recon = prediction + dec_delta
-                    
-                    fmask = np.abs(data - recon) > error_bound * ratio
-                    fidx = np.flatnonzero(fmask).astype(np.int32)
-                    
-                    if fidx.size:
-                        fval = data.flat[fidx].astype(np.float32)
-                        cmask = zlib.compress(np.packbits(fmask.ravel()).tobytes(), level=6)
-                        cidx = zlib.compress(fidx.tobytes(), level=6)
-                        cval = zlib.compress(fval.tobytes(), level=6)
-                        if len(cmask) <= len(cidx):
-                            finfo = pickle.dumps({'mask': cmask, 'val': cval})
-                        else:
-                            finfo = pickle.dumps({'idx': cidx, 'val': cval})
-                        fbytes = b'DELTAFAIL' + finfo
-                    else:
-                        fbytes = b''
-                    
-                    test_length = len(comp_delta) + len(fbytes)
-                    if test_length < best_length:
-                        best_length = test_length
-                        best_error_bound = test_eb
-                        best_compressed = comp_delta
-                        best_fail_bytes = fbytes
-                        test_eb /= 2
-                    else:
-                        break
+                # print(f"Comparing: fail-only={sizes['fail-only']:,}, delta+fail={sizes['delta+fail']:,}, direct={sizes['direct']:,}")
                 
-                # Binary search: try doubling error bound
-                test_eb = rmse * 2
-                for _ in range(10):  # Limit iterations
-                    const_eb = np.full_like(delta, test_eb)
-                    comp_delta = self.compressor.compress(delta, const_eb, ratio=ratio)
-                    dec_delta = self.compressor.decompress(comp_delta)
-                    recon = prediction + dec_delta
-                    
-                    fmask = np.abs(data - recon) > error_bound * ratio
-                    fidx = np.flatnonzero(fmask).astype(np.int32)
-                    
-                    if fidx.size:
-                        fval = data.flat[fidx].astype(np.float32)
-                        cmask = zlib.compress(np.packbits(fmask.ravel()).tobytes(), level=6)
-                        cidx = zlib.compress(fidx.tobytes(), level=6)
-                        cval = zlib.compress(fval.tobytes(), level=6)
-                        if len(cmask) <= len(cidx):
-                            finfo = pickle.dumps({'mask': cmask, 'val': cval})
-                        else:
-                            finfo = pickle.dumps({'idx': cidx, 'val': cval})
-                        fbytes = b'DELTAFAIL' + finfo
-                    else:
-                        fbytes = b''
-                    
-                    test_length = len(comp_delta) + len(fbytes)
-                    if test_length < best_length:
-                        best_length = test_length
-                        best_error_bound = test_eb
-                        best_compressed = comp_delta
-                        best_fail_bytes = fbytes
-                        test_eb *= 2
-                    else:
-                        break
+                # best_method = min(sizes, key=sizes.get)
                 
-                # Combine compressed delta and fail values
-                compressed_delta = best_compressed + best_fail_bytes
-                
-                # Compare with direct compression
-                compressed_direct = self.compressor.compress(data, error_bound, ratio=ratio)
-                
-                # Choose smaller, store flag
-                if len(compressed_delta) < len(compressed_direct):
-                    compressed_dict[pressure_level] = b'DELTA' + compressed_delta
-                    cr = data.nbytes / len(compressed_delta)
-                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_delta):,} bytes) [DELTA, eb={best_error_bound:.4f}]")
-                else:
-                    compressed_dict[pressure_level] = b'DIRECT' + compressed_direct
-                    cr = data.nbytes / len(compressed_direct)
-                    print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(compressed_direct):,} bytes) [DIRECT]")
-                
-        return compressed_dict
-    
+                # if best_method == 'fail-only':
+                #     # Pack fail-only data
+                #     fail_only_data = pickle.dumps({'fail': fail_bytes_only})
+                #     compressed_dict[pressure_level] = b'DELTA' + fail_only_data
+                #     cr = data.nbytes / len(fail_only_data)
+                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {len(fail_only_data):,} bytes) [DELTA-FAILONLY]")
+                # elif best_method == 'delta+fail':
+                #     compressed_dict[pressure_level] = b'DELTA' + compressed_delta_with_fail
+                #     cr = data.nbytes / sizes['delta+fail']
+                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {sizes['delta+fail']:,} bytes) [DELTA]")
+                # else:
+                #     compressed_dict[pressure_level] = b'DIRECT' + compressed_direct
+                #     cr = data.nbytes / sizes['direct']
+                #     print(f"{pressure_level:>4} hPa: {cr:6.2f}x ({data.nbytes:,} -> {sizes['direct']:,} bytes) [DIRECT]")
+        
+        elapsed_time = time.time() - start_time
+        throughput = total_bytes / elapsed_time / (1024**2)  # MB/s
+        print(f"\nCompression completed in {elapsed_time:.2f}s, throughput: {throughput:.2f} MB/s")
+
+        return pickle.dumps(compressed_dict)
+
     def decompress_delta(self, compressed_dict: Dict[str, bytes],
                         pressure_levels: List[str]) -> Dict[str, np.ndarray]:
         """
@@ -341,6 +414,7 @@ class PressureLevelDeltaCompressor:
         Returns:
             Dictionary of decompressed data
         """
+        compressed_dict = pickle.loads(compressed_dict)
         decompressed_dict = {}
         pressure_values = [float(p) for p in pressure_levels]
         
@@ -350,80 +424,23 @@ class PressureLevelDeltaCompressor:
                 
             compressed = compressed_dict[pressure_level]
             
-            if i == 0 or compressed.startswith(b'DIRECT'):
+            if compressed['method'] == 'direct':
                 # Direct decompression
-                bitstream = compressed[6:] if compressed.startswith(b'DIRECT') else compressed
-                decompressed_dict[pressure_level] = self.compressor.decompress(bitstream)
-            elif compressed.startswith(b'DELTA'):
+                decompressed_dict[pressure_level] = self.compressor.decompress(compressed['data'])
+            elif compressed['method'] == 'delta':
                 # Delta decompression
                 prev_pressure_level = pressure_levels[i-1]
-                if prev_pressure_level not in decompressed_dict:
-                    decompressed_dict[pressure_level] = self.compressor.decompress(compressed[5:])
-                    continue
                 
                 prev_data = decompressed_dict[prev_pressure_level]
                 prediction = self.compute_prediction(prev_data, pressure_values[i], pressure_values[i-1])
+                delta = self.compressor.decompress(compressed['delta'])
+                reconstructed = prediction + delta
                 
-                # Extract delta bitstream and fail values
-                bitstream = compressed[5:]
-                if b'DELTAFAIL' in bitstream:
-                    pos = bitstream.index(b'DELTAFAIL')
-                    delta_bytes = bitstream[:pos]
-                    fail_info = pickle.loads(bitstream[pos + 9:])
-                    
-                    # Decompress delta
-                    delta = self.compressor.decompress(delta_bytes)
-                    reconstructed = prediction + delta
-                    
-                    # Restore fail values
-                    if 'mask' in fail_info:
-                        fail_mask = np.unpackbits(np.frombuffer(zlib.decompress(fail_info['mask']), dtype=np.uint8))
-                        fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
-                        fail_idx = np.flatnonzero(fail_mask[:reconstructed.size])
-                    else:
-                        fail_idx = np.frombuffer(zlib.decompress(fail_info['idx']), dtype=np.int32)
-                        fail_val = np.frombuffer(zlib.decompress(fail_info['val']), dtype=np.float32)
-                    
+                # Restore fail values if present
+                if 'fail' in compressed:
+                    fail_idx, fail_val = self._decode_fail_values(compressed['fail'])
                     reconstructed.flat[fail_idx] = fail_val
-                    decompressed_dict[pressure_level] = reconstructed
-                else:
-                    # No fail values
-                    delta = self.compressor.decompress(bitstream)
-                    decompressed_dict[pressure_level] = prediction + delta
+                
+                decompressed_dict[pressure_level] = reconstructed
                 
         return decompressed_dict
-    
-    def analyze_compression_efficiency(self, data_dict: Dict[str, np.ndarray],
-                                     compressed_dict: Dict[str, bytes],
-                                     pressure_levels: List[str]) -> Dict:
-        """
-        Analyze compression efficiency and provide statistics.
-        """
-        total_original = 0
-        total_compressed = 0
-        level_stats = {}
-        
-        for pressure_level in pressure_levels:
-            if pressure_level in data_dict and pressure_level in compressed_dict:
-                original_size = data_dict[pressure_level].nbytes
-                compressed_size = len(compressed_dict[pressure_level])
-                ratio = original_size / compressed_size
-                
-                level_stats[pressure_level] = {
-                    'original_size': original_size,
-                    'compressed_size': compressed_size,
-                    'compression_ratio': ratio,
-                    'data_shape': data_dict[pressure_level].shape
-                }
-                
-                total_original += original_size
-                total_compressed += compressed_size
-        
-        overall_ratio = total_original / total_compressed if total_compressed > 0 else 0
-        
-        return {
-            'level_stats': level_stats,
-            'total_original_size': total_original,
-            'total_compressed_size': total_compressed,
-            'overall_compression_ratio': overall_ratio
-        }
