@@ -131,22 +131,40 @@ class ErrorBoundedJP2KCodec:
             fail_info_u16['compression_ratio_fail_u16_1'] = fail_count_jp2k_hat * 2 / (len(residual_q_w_bitstream) + 1e-8)
 
         # sparse residuals
-        if (key_fail_u16 is None) or (key_fail_u16 in ['2', '3']):
+        if (key_fail_u16 is None) or (key_fail_u16 in ['2', '3', '4']):
             non_zero_mask = residual_q_w != 0
-            non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
-            non_zero_bitmask = np.packbits(non_zero_mask.ravel())
             non_zero_val = residual_q_w[non_zero_mask].ravel()
-
-            non_zero_idx_bitstream = blosc.compress(non_zero_idx, typesize=4, cname="zstd", clevel=9)
-            non_zero_bitmask_bitstream = blosc.compress(non_zero_bitmask.tobytes(), typesize=1, cname="zstd", clevel=9)
             non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
 
             if (key_fail_u16 is None) or (key_fail_u16 == '2'):
+                # idx + val
+                non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
+                non_zero_idx_bitstream = blosc.compress(non_zero_idx, typesize=4, cname="zstd", clevel=9)
                 bitstream_fail_u16_candidates['2'] = pickle.dumps(("2", non_zero_idx_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
                 fail_info_u16['compression_ratio_fail_u16_2'] = fail_count_jp2k_hat * 2 / (len(non_zero_idx_bitstream) + len(non_zero_val_bitstream) + 1e-8)
             if (key_fail_u16 is None) or (key_fail_u16 == '3'):
+                # bitmask + val
+                non_zero_bitmask = np.packbits(non_zero_mask.ravel())
+                non_zero_bitmask_bitstream = blosc.compress(non_zero_bitmask.tobytes(), typesize=1, cname="zstd", clevel=9)
                 bitstream_fail_u16_candidates['3'] = pickle.dumps(("3", non_zero_bitmask_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
                 fail_info_u16['compression_ratio_fail_u16_3'] = fail_count_jp2k_hat * 2 / (len(non_zero_bitmask_bitstream) + len(non_zero_val_bitstream) + 1e-8)
+            if (key_fail_u16 is None) or (key_fail_u16 == '4'):
+                # Use block id (uint16) + offset (uint16) + val
+                non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
+                block_size = 65536
+                n_blocks = (non_zero_mask.size + block_size - 1) // block_size
+
+                block_idx_count = np.bincount(non_zero_idx // block_size, minlength=n_blocks).astype(np.uint16)
+                block_idx_offset = (non_zero_idx % block_size).astype(np.uint16)
+
+                block_idx_count_bitstream = blosc.compress(block_idx_count, typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
+                block_idx_offset_bitstream = blosc.compress(block_idx_offset, typesize=2, cname="zstd", clevel=9)
+
+                bitstream_fail_u16_candidates['4'] = pickle.dumps(("4", block_idx_count_bitstream, block_idx_offset_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
+                fail_info_u16['compression_ratio_fail_u16_4'] = fail_count_jp2k_hat * 2 / (len(block_idx_count_bitstream) + len(block_idx_offset_bitstream) + len(non_zero_val_bitstream) + 1e-8)
+                # print(fail_count_jp2k_hat * 2/len(block_idx_count_bitstream))
+                # print(fail_count_jp2k_hat * 2/len(block_idx_offset_bitstream))
+                # print(fail_count_jp2k_hat * 2/len(non_zero_val_bitstream))
         
         assert len(bitstream_fail_u16_candidates) > 0, "No failure handling methods generated."
         # choose best
@@ -197,6 +215,20 @@ class ErrorBoundedJP2KCodec:
 
             residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
             residual_q_w[mask] = non_zero_val
+            residual_q_w = residual_q_w.reshape(shape)
+        elif key_fail_u16 == "4":
+            block_idx_count_bitstream, block_idx_offset_bitstream, non_zero_val_bitstream = payload
+            block_idx_count = np.frombuffer(blosc.decompress(block_idx_count_bitstream), dtype=np.uint16)
+            block_idx_offset = np.frombuffer(blosc.decompress(block_idx_offset_bitstream), dtype=np.uint16)
+            non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
+
+            block_size = 65536
+            block_idx = np.repeat(np.arange(block_idx_count.size, dtype=np.int32), block_idx_count.astype(np.int32))
+            non_zero_idx = block_idx * block_size + block_idx_offset.astype(np.int32)
+            non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
+
+            residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
+            residual_q_w[non_zero_idx] = non_zero_val
             residual_q_w = residual_q_w.reshape(shape)
         else:
             raise ValueError(f"Unknown key_fail_u16: {key_fail_u16}")
@@ -250,7 +282,7 @@ class ErrorBoundedJP2KCodec:
 
     # ========= Compression/Decompression =========
 
-    def compress(self, data, error_bound, cratio, key_fail_u16=None):
+    def compress(self, data, error_bound, cratio, key_fail_u16='3'):
         assert (data.shape == error_bound.shape) and (data.ndim == 3), "data and error_bound must be float32 with shape (N,H,W)"
         assert (data.dtype == np.float32) and (error_bound.dtype == np.float32), "data and error_bound must be float32"
 
