@@ -345,7 +345,6 @@ class ErrorBoundedJP2KCodec:
         best_cratio = cratio_start
         best_result = self.compress(data, error_bound, best_cratio)
         best_compression_ratio = data.nbytes / len(best_result[0])
-        is_best_found = False
 
         # go right
         current_cratio = best_cratio
@@ -359,7 +358,6 @@ class ErrorBoundedJP2KCodec:
                 best_cratio = current_cratio
                 best_result = result
                 best_compression_ratio = compression_ratio
-                is_best_found = True
                 # reset stop counter
                 stop_counter = 0
             else:
@@ -382,7 +380,6 @@ class ErrorBoundedJP2KCodec:
                 best_cratio = current_cratio
                 best_result = result
                 best_compression_ratio = compression_ratio
-                is_best_found = True
                 # reset stop counter
                 stop_counter = 0
             else:
@@ -391,35 +388,29 @@ class ErrorBoundedJP2KCodec:
                 if stop_counter >= stop_counts:
                     break
 
-        return best_result, best_cratio, is_best_found
+        return best_result, best_cratio
     
     def grid_search_target_compression(self, data, error_bound, target_compression_ratio):
         cratio_step = 5
-        cratio_start = 50
+        cratio_start = cratio_step
         stop_counts = 2
         assert stop_counts >= 1
 
         closest_cratio = cratio_start
         closest_result = self.compress(data, error_bound, closest_cratio)
         closest_compression_ratio = data.nbytes / len(closest_result[0])
-        is_closest_found = False
 
         # go right
         current_cratio = closest_cratio
         stop_counter = 0
-        best_compression_ratio = closest_compression_ratio
         while True
             current_cratio += cratio_step
             result = self.compress(data, error_bound, current_cratio)
             compression_ratio = data.nbytes / len(result[0])
-            if compression_ratio > best_compression_ratio:
-                best_compression_ratio = compression_ratio
-                # only take the up slope
-                if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
-                    closest_cratio = current_cratio
-                    closest_result = result
-                    closest_compression_ratio = compression_ratio
-                    is_closest_found = True
+            if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
+                closest_cratio = current_cratio
+                closest_result = result
+                closest_compression_ratio = compression_ratio
                 # reset stop counter
                 stop_counter = 0
             else:
@@ -428,28 +419,4 @@ class ErrorBoundedJP2KCodec:
                 if stop_counter >= stop_counts:
                     break
 
-        # go left
-        current_cratio = closest_cratio
-        stop_counter = 0
-        worst_compression_ratio = closest_compression_ratio
-        while True
-            current_cratio -= cratio_step
-            result = self.compress(data, error_bound, current_cratio)
-            compression_ratio = data.nbytes / len(result[0])
-            if compression_ratio < worst_compression_ratio:
-                worst_compression_ratio = compression_ratio
-                # only take the up slope
-                if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
-                    closest_cratio = current_cratio
-                    closest_result = result
-                    closest_compression_ratio = compression_ratio
-                    is_closest_found = True
-                # reset stop counter
-                stop_counter = 0
-            else:
-                # increment stop counter
-                stop_counter += 1
-                if stop_counter >= stop_counts:
-                    break
-
-        return closest_result, closest_cratio, is_closest_found
+        return closest_result, closest_cratio
