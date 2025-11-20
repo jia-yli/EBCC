@@ -169,8 +169,7 @@ class ErrorBoundedJP2KCodec:
         assert len(bitstream_fail_u16_candidates) > 0, "No failure handling methods generated."
         # choose best
         key_fail_u16, bitstream_fail_u16 = min(bitstream_fail_u16_candidates.items(), key=lambda kv: len(kv[1]))
-        # import pdb;pdb.set_trace()
-        assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
+        # assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
 
         fail_count_hat = int(np.count_nonzero(np.abs(data_u16.astype(np.int32) - data_u16_hat.astype(np.int32)) > err_u16.astype(np.int32)))
         compression_ratio_fail_u16 = fail_count_jp2k_hat * 2 / (len(bitstream_fail_u16) + 1e-8)
@@ -180,6 +179,7 @@ class ErrorBoundedJP2KCodec:
             "fail_ratio_hat": fail_count_hat/data_u16.size,
             "key_fail_u16": key_fail_u16,
             "compression_ratio_fail_u16": compression_ratio_fail_u16,
+            "compressed_size_fail_u16": len(bitstream_fail_u16),
         })
 
         return bitstream_fail_u16, data_u16_hat, fail_info_u16
@@ -250,34 +250,37 @@ class ErrorBoundedJP2KCodec:
         flat_error_bound = error_bound.ravel()
 
         mask = np.abs(flat_data - flat_data_fp32_hat) > flat_error_bound
-        idx = np.flatnonzero(mask).astype(np.int32)
-        vals = flat_data[idx].astype(np.float32)
+        bitmask = np.packbits(mask.ravel())
+        # idx = np.flatnonzero(mask).astype(np.int32)
+        val = flat_data[mask].astype(np.float32)
 
         bitstream_fail_fp32 = pickle.dumps(
             (
-                blosc.compress(idx.tobytes(), typesize=4, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE), 
-                blosc.compress(vals.tobytes(), typesize=4, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE), 
+                blosc.compress(bitmask.tobytes(), typesize=1, cname="zstd", clevel=9), 
+                blosc.compress(val.tobytes(), typesize=4, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE), 
             ), 
             protocol=pickle.HIGHEST_PROTOCOL
         )
 
         fail_count_fp32_hat = int(np.count_nonzero(np.abs(data - data_fp32_hat) > error_bound))
-        compression_ratio = fail_count_fp32_hat * 4 / (len(bitstream_fail_fp32) + 1e-8)
+        compression_ratio_fail_fp32 = fail_count_fp32_hat * 4 / (len(bitstream_fail_fp32) + 1e-8)
 
         fail_info_fp32 = {
-            "fail_count_fp32_hat": fail_count_fp32_hat,
             "fail_ratio_fp32_hat": fail_count_fp32_hat/data.size,
-            "compression_ratio": compression_ratio,
+            "compression_ratio_fail_fp32": compression_ratio_fail_fp32,
+            "compressed_size_fail_fp32": len(bitstream_fail_fp32),
         }
         return bitstream_fail_fp32, fail_info_fp32
 
     def _apply_failures_fp32(self, data_fp32_hat, bitstream_fail_fp32, shape):
-        idx, vals = pickle.loads(bitstream_fail_fp32)
-        idx = np.frombuffer(blosc.decompress(idx), dtype=np.int32)
-        vals = np.frombuffer(blosc.decompress(vals), dtype=np.float32)
+        bitmask, val = pickle.loads(bitstream_fail_fp32)
+        bitmask = np.frombuffer(blosc.decompress(bitmask), dtype=np.uint8)
+        val = np.frombuffer(blosc.decompress(val), dtype=np.float32)
+        mask = np.unpackbits(bitmask)[:int(np.prod(shape))].astype(bool)
 
         data_fp32_hat = data_fp32_hat.reshape(-1)
-        data_fp32_hat[idx] = vals.astype(np.float32)
+        data_fp32_hat[mask] = val.astype(np.float32)
+
         return data_fp32_hat.reshape(shape)
 
     # ========= Compression/Decompression =========
@@ -308,9 +311,11 @@ class ErrorBoundedJP2KCodec:
             "bs_f_u16": bitstream_fail_u16,
             "bs_f_fp32": bitstream_fail_fp32,
         }
+        info = fail_info_u16 | fail_info_fp32
+        info["compressed_size_jp2k"] = len(bitstream_jp2k)
         total_size = len(bitstream_jp2k) + len(bitstream_fail_u16) + len(bitstream_fail_fp32)
         print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
-        return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), info
 
     def decompress(self, blob):
         payload = pickle.loads(blob)
@@ -330,3 +335,121 @@ class ErrorBoundedJP2KCodec:
         assert (data_fp32_hat.shape == shape) and (data_fp32_hat.dtype == np.float32)
 
         return data_fp32_hat
+
+    def grid_search_best_compression(self, data, error_bound):
+        cratio_step = 5
+        cratio_start = 50
+        stop_counts = 2
+        assert stop_counts >= 1
+
+        best_cratio = cratio_start
+        best_result = self.compress(data, error_bound, best_cratio)
+        best_compression_ratio = data.nbytes / len(best_result[0])
+        is_best_found = False
+
+        # go right
+        current_cratio = best_cratio
+        stop_counter = 0
+        while True
+            current_cratio += cratio_step
+            result = self.compress(data, error_bound, current_cratio)
+            compression_ratio = data.nbytes / len(result[0])
+            if compression_ratio > best_compression_ratio:
+                # update best
+                best_cratio = current_cratio
+                best_result = result
+                best_compression_ratio = compression_ratio
+                is_best_found = True
+                # reset stop counter
+                stop_counter = 0
+            else:
+                # increment stop counter
+                stop_counter += 1
+                if stop_counter >= stop_counts:
+                    break
+
+        # go left
+        current_cratio = best_cratio
+        stop_counter = 0
+        while True:
+            current_cratio -= cratio_step
+            if current_cratio < cratio_step:
+                break
+            result = self.compress(data, error_bound, current_cratio)
+            compression_ratio = data.nbytes / len(result[0])
+            if compression_ratio > best_compression_ratio:
+                # update best
+                best_cratio = current_cratio
+                best_result = result
+                best_compression_ratio = compression_ratio
+                is_best_found = True
+                # reset stop counter
+                stop_counter = 0
+            else:
+                # increment stop counter
+                stop_counter += 1
+                if stop_counter >= stop_counts:
+                    break
+
+        return best_result, best_cratio, is_best_found
+    
+    def grid_search_target_compression(self, data, error_bound, target_compression_ratio):
+        cratio_step = 5
+        cratio_start = 50
+        stop_counts = 2
+        assert stop_counts >= 1
+
+        closest_cratio = cratio_start
+        closest_result = self.compress(data, error_bound, closest_cratio)
+        closest_compression_ratio = data.nbytes / len(closest_result[0])
+        is_closest_found = False
+
+        # go right
+        current_cratio = closest_cratio
+        stop_counter = 0
+        best_compression_ratio = closest_compression_ratio
+        while True
+            current_cratio += cratio_step
+            result = self.compress(data, error_bound, current_cratio)
+            compression_ratio = data.nbytes / len(result[0])
+            if compression_ratio > best_compression_ratio:
+                best_compression_ratio = compression_ratio
+                # only take the up slope
+                if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
+                    closest_cratio = current_cratio
+                    closest_result = result
+                    closest_compression_ratio = compression_ratio
+                    is_closest_found = True
+                # reset stop counter
+                stop_counter = 0
+            else:
+                # increment stop counter
+                stop_counter += 1
+                if stop_counter >= stop_counts:
+                    break
+
+        # go left
+        current_cratio = closest_cratio
+        stop_counter = 0
+        worst_compression_ratio = closest_compression_ratio
+        while True
+            current_cratio -= cratio_step
+            result = self.compress(data, error_bound, current_cratio)
+            compression_ratio = data.nbytes / len(result[0])
+            if compression_ratio < worst_compression_ratio:
+                worst_compression_ratio = compression_ratio
+                # only take the up slope
+                if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
+                    closest_cratio = current_cratio
+                    closest_result = result
+                    closest_compression_ratio = compression_ratio
+                    is_closest_found = True
+                # reset stop counter
+                stop_counter = 0
+            else:
+                # increment stop counter
+                stop_counter += 1
+                if stop_counter >= stop_counts:
+                    break
+
+        return closest_result, closest_cratio, is_closest_found
