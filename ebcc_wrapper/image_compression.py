@@ -1,6 +1,7 @@
 import os
 import tempfile
 import pickle
+import time
 
 import numpy as np
 import glymur
@@ -286,8 +287,11 @@ class ErrorBoundedJP2KCodec:
     # ========= Compression/Decompression =========
 
     def compress(self, data, error_bound, cratio, key_fail_u16='3'):
-        assert (data.shape == error_bound.shape) and (data.ndim == 3), "data and error_bound must be float32 with shape (N,H,W)"
+        assert (data.shape == error_bound.shape) and (data.ndim > 1)
         assert (data.dtype == np.float32) and (error_bound.dtype == np.float32), "data and error_bound must be float32"
+        data_shape = data.shape
+        data = data.reshape(-1, data_shape[-2], data_shape[-1])
+        error_bound = error_bound.reshape(-1, data_shape[-2], data_shape[-1])
 
         data_u16, dmin, dmax = self._minmax_scale_to_u16(data)
         err_u16 = self._scale_err_to_u16(error_bound, dmin, dmax)
@@ -296,17 +300,17 @@ class ErrorBoundedJP2KCodec:
         data_u16_jp2k_hat = self._decode_jp2k_u16(bitstream_jp2k)
 
         bitstream_fail_u16, data_u16_hat, fail_info_u16 = self._extract_failures_u16(data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16=key_fail_u16)
-        print(f"U16 Failures: {fail_info_u16}")
+        # print(f"U16 Failures: {fail_info_u16}")
 
         # final checks
         data_fp32_hat = self._minmax_scale_from_u16(data_u16_hat, dmin, dmax)
         bitstream_fail_fp32, fail_info_fp32 = self._extract_failures_fp32(data, data_fp32_hat, error_bound)
-        print(f"FP32 Failures: {fail_info_fp32}")
+        # print(f"FP32 Failures: {fail_info_fp32}")
 
         payload = {
             "min": dmin,
             "max": dmax,
-            "shape": tuple(data.shape),
+            "shape": tuple(data_shape),
             "bs_jp2k": bitstream_jp2k,
             "bs_f_u16": bitstream_fail_u16,
             "bs_f_fp32": bitstream_fail_fp32,
@@ -314,7 +318,7 @@ class ErrorBoundedJP2KCodec:
         info = fail_info_u16 | fail_info_fp32
         info["compressed_size_jp2k"] = len(bitstream_jp2k)
         total_size = len(bitstream_jp2k) + len(bitstream_fail_u16) + len(bitstream_fail_fp32)
-        print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
+        # print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
         return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), info
 
     def decompress(self, blob):
@@ -325,14 +329,14 @@ class ErrorBoundedJP2KCodec:
         bitstream_fail_u16 = payload["bs_f_u16"]
         bitstream_fail_fp32 = payload["bs_f_fp32"]
 
+        _shape = (int(np.prod(shape[:-2])), shape[-2], shape[-1])
         data_u16_jp2k_hat = self._decode_jp2k_u16(bitstream_jp2k)
-        assert data_u16_jp2k_hat.shape == shape
 
-        data_u16_hat = self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, shape)
+        data_u16_hat = self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, _shape)
         data_fp32_hat = self._minmax_scale_from_u16(data_u16_hat, dmin, dmax)
-        data_fp32_hat = self._apply_failures_fp32(data_fp32_hat, bitstream_fail_fp32, shape)
+        data_fp32_hat = self._apply_failures_fp32(data_fp32_hat, bitstream_fail_fp32, _shape)
 
-        assert (data_fp32_hat.shape == shape) and (data_fp32_hat.dtype == np.float32)
+        data_fp32_hat = data_fp32_hat.reshape(shape)
 
         return data_fp32_hat
 
@@ -349,7 +353,7 @@ class ErrorBoundedJP2KCodec:
         # go right
         current_cratio = best_cratio
         stop_counter = 0
-        while True
+        while True:
             current_cratio += cratio_step
             result = self.compress(data, error_bound, current_cratio)
             compression_ratio = data.nbytes / len(result[0])
@@ -403,7 +407,7 @@ class ErrorBoundedJP2KCodec:
         # go right
         current_cratio = closest_cratio
         stop_counter = 0
-        while True
+        while True:
             current_cratio += cratio_step
             result = self.compress(data, error_bound, current_cratio)
             compression_ratio = data.nbytes / len(result[0])
@@ -420,3 +424,21 @@ class ErrorBoundedJP2KCodec:
                     break
 
         return closest_result, closest_cratio
+
+    @staticmethod
+    def run_benchmark_best_compression(data, error_bound):
+        codec = ErrorBoundedJP2KCodec()
+
+        _, best_cratio = codec.grid_search_best_compression(data, error_bound)
+
+        # Time final compression (re-run for timing consistency)
+        compression_start_time = time.time()
+        bitstream, info = codec.compress(data, error_bound, best_cratio)
+        compression_time = time.time() - compression_start_time
+
+        # Time decompression
+        decompression_start_time = time.time()
+        data_hat = codec.decompress(bitstream)
+        decompression_time = time.time() - decompression_start_time
+
+        return data_hat, len(bitstream), compression_time, decompression_time
