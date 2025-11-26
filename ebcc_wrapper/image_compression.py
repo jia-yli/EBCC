@@ -2,6 +2,7 @@ import os
 import tempfile
 import pickle
 import time
+import math
 
 import numpy as np
 import glymur
@@ -288,7 +289,8 @@ class ErrorBoundedJP2KCodec:
 
     def compress(self, data, error_bound, cratio, key_fail_u16='3'):
         assert (data.shape == error_bound.shape) and (data.ndim > 1)
-        assert (data.dtype == np.float32) and (error_bound.dtype == np.float32), "data and error_bound must be float32"
+        error_bound = error_bound.astype(np.float32)
+        assert (data.dtype == np.float32), "data and error_bound must be float32"
         data_shape = data.shape
         data = data.reshape(-1, data_shape[-2], data_shape[-1])
         error_bound = error_bound.reshape(-1, data_shape[-2], data_shape[-1])
@@ -425,6 +427,70 @@ class ErrorBoundedJP2KCodec:
 
         return closest_result, closest_cratio
 
+    def golden_section_search_best_compression(self, data, error_bound):
+        cratio_step = 5
+        min_cratio = cratio_step // 2
+        max_cratio = 200
+
+        phi = (1 + math.sqrt(5)) / 2
+
+        def eval_at(cratio):
+            if cratio not in cache:
+                result = self.compress(data, error_bound, cratio)
+                ratio = data.nbytes / max(1, len(result[0]))
+                cache[cratio] = (ratio, result)
+            return cache[cratio]
+
+        a, b = int(min_cratio), int(max_cratio)
+        cache = {}
+
+        # initial interior integers with strict ordering a < c < d < b
+        c = int(b - math.ceil((b - a) / phi))
+        d = int(a + math.ceil((b - a) / phi))
+        c = max(a + 1, min(b - 1, c))
+        d = max(a + 1, min(b - 1, d))
+        if c >= d:
+            c, d = d - 1, d
+
+        compression_ratio_c, result_c = eval_at(c)
+        compression_ratio_d, result_d = eval_at(d)
+
+        if compression_ratio_c >= compression_ratio_d:
+            best_cratio = c
+            best_result = result_c
+            best_compression_ratio = compression_ratio_c
+        else:
+            best_cratio = d
+            best_result = result_d
+            best_compression_ratio = compression_ratio_d
+
+        # stop when the interval is smaller than the step
+        while (b - a) >= cratio_step:
+            if compression_ratio_c > compression_ratio_d:
+                # keep [a, d)
+                b = d
+                d, compression_ratio_d, result_d = c, compression_ratio_c, result_c
+                c = int(b - math.ceil((b - a) / phi))
+                c = max(a + 1, min(b - 1, c))
+                if c == d:
+                    c = max(a + 1, d - 1)
+                compression_ratio_c, result_c = eval_at(c)
+                if compression_ratio_c > best_compression_ratio:
+                    best_cratio, best_result, best_compression_ratio = c, result_c, compression_ratio_c
+            else:
+                # keep (c, b]
+                a = c
+                c, compression_ratio_c, result_c = d, compression_ratio_d, result_d
+                d = int(a + math.ceil((b - a) / phi))
+                d = max(a + 1, min(b - 1, d))
+                if d == c:
+                    d = min(b - 1, c + 1)
+                compression_ratio_d, result_d = eval_at(d)
+                if compression_ratio_d > best_compression_ratio:
+                    best_cratio, best_result, best_compression_ratio = d, result_d, compression_ratio_d
+
+        return best_result, best_cratio
+
     @staticmethod
     def run_benchmark_best_compression(data, error_bound):
         codec = ErrorBoundedJP2KCodec()
@@ -441,4 +507,4 @@ class ErrorBoundedJP2KCodec:
         data_hat = codec.decompress(bitstream)
         decompression_time = time.time() - decompression_start_time
 
-        return data_hat, len(bitstream), compression_time, decompression_time
+        return data_hat, len(bitstream), compression_time, decompression_time, best_cratio

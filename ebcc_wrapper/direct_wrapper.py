@@ -6,6 +6,7 @@ instead of requiring HDF5 files.
 import os
 import numpy as np
 import h5py
+import time
 import tempfile
 import zlib
 import pickle
@@ -59,7 +60,7 @@ class EBCCDirectWrapper:
         
         # Create EBCC filter for pointwise error
         ebcc_filter = EBCC_Filter(
-            base_cr=10,
+            base_cr=100,
             height=combined_data.shape[-2],
             width=combined_data.shape[-1],
             data_dim=len(combined_data.shape),
@@ -69,10 +70,13 @@ class EBCCDirectWrapper:
         
         # Use temporary file to get compressed data; reuse it to read reconstructed data
         with tempfile.NamedTemporaryFile() as temp_file:
+            start_time = time.time()
             with h5py.File(temp_file.name, 'w') as hdf5_file:
                 hdf5_file.create_dataset('data', data=combined_data, **ebcc_filter)
             temp_file.seek(0)
             compressed_bytes = temp_file.read()
+            end_time = time.time()
+            # print(f"EBCC compression completed in {end_time - start_time:.2f}s, throughput: {data.nbytes / (end_time - start_time) / (1024**2):.2f} MB/s")
             
             # Read back reconstruction and append failing values
             with h5py.File(temp_file.name, 'r') as hf:
@@ -80,6 +84,8 @@ class EBCCDirectWrapper:
             
             fail_mask = np.abs(data - data_hat) > error_bound_array * ratio
             fail_idx = np.flatnonzero(fail_mask).astype(np.int32)
+            # print(f"EBCC compression: {fail_mask.sum()/fail_mask.size} of values exceed error bounds.")
+            # print(f"EBCC compression: {len(compressed_bytes)/data.size}x compression ratio achieved without failed value.")
             if fail_idx.size:
                 fail_val = data.flat[fail_idx].astype(np.float32)
                 cmask = zlib.compress(np.packbits(fail_mask.ravel()).tobytes(), level=6)
