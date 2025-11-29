@@ -3,8 +3,10 @@ import time
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from ebcc_wrapper import ErrorBoundedJP2KCodec
+from multiprocessing import Pool
 
 def run_scan(
   era5_path,
@@ -12,9 +14,7 @@ def run_scan(
   month,
   variable,
   ratio = 1,
-  cratio_start = 10,
-  cratio_stop = 100,
-  cratio_step = 5,
+  cratio = 30
 ):
   reanalysis_file = os.path.join(era5_path, f"single_level/reanalysis/{year}/{month}/{variable}.npy")
   spread_file = os.path.join(era5_path, f"single_level/interpolated_ensemble_spread/{year}/{month}/{variable}.npy")
@@ -29,62 +29,60 @@ def run_scan(
 
   codec = ErrorBoundedJP2KCodec()
 
-  steps = 8
-  data = data[:steps]
-  error_bound = error_bound[:steps]
+  steps = 6
+  data = data[::steps]
+  error_bound = error_bound[::steps]
 
   data_size = data.nbytes
 
-  results = []
-  for cratio in range(cratio_start, cratio_stop + 1, cratio_step):
-    print(f"Running {cratio} for {variable} ...")
-    compression_start_time = time.time()
-    blob, info = codec.compress(data, error_bound, cratio=cratio, key_fail_u16=None)
-    compression_end_time = time.time()
-    compression_time = compression_end_time - compression_start_time
+  # print(f"Running {cratio} for {variable} ...")
+  compression_start_time = time.time()
+  blob, info = codec.compress(data, error_bound, cratio=cratio, key_fail_u16=None)
+  compression_end_time = time.time()
+  compression_time = compression_end_time - compression_start_time
 
-    decompression_start_time = time.time()
-    data_hat = codec.decompress(blob)
-    decompression_end_time = time.time()
-    decompression_time = decompression_end_time - decompression_start_time
+  decompression_start_time = time.time()
+  data_hat = codec.decompress(blob)
+  decompression_end_time = time.time()
+  decompression_time = decompression_end_time - decompression_start_time
 
-    check_passed = np.all(np.abs(data_hat - data) <= error_bound)
-    mse = float(np.mean(((data_hat - data)/(np.max(data)-np.min(data))) ** 2))
-    rmse = float(np.sqrt(mse))
-    compressed_size = len(blob)
-    compression_ratio = data_size / compressed_size
+  check_passed = np.all(np.abs(data_hat - data) <= error_bound)
+  mse = float(np.mean(((data_hat - data)/(np.max(data)-np.min(data))) ** 2))
+  rmse = float(np.sqrt(mse))
+  compressed_size = len(blob)
+  compression_ratio = data_size / compressed_size
+  # print(f"  cratio: {cratio}, compression_ratio: {compression_ratio:.2f}, mse: {mse:.6e}, rmse: {rmse:.6e}, check_passed: {check_passed}")
 
-    result = {
-      "variable": variable,
-      "year": year,
-      "month": month,
-      "ratio": ratio,
-      "cratio": cratio,
-      "data_size": data_size,
-      "check_passed": check_passed,
-      "compressed_size_jp2k": info["compressed_size_jp2k"],
-      "compressed_size_fail_u16": info["compressed_size_fail_u16"],
-      "compressed_size_fail_fp32": info["compressed_size_fail_fp32"],
-      "compressed_size": compressed_size,
-      "compression_ratio": compression_ratio,
-      "mse": mse,
-      "rmse": rmse,
-      "compression_ratio_u16_1": info.get("compression_ratio_fail_u16_1"),
-      "compression_ratio_u16_2": info.get("compression_ratio_fail_u16_2"),
-      "compression_ratio_u16_3": info.get("compression_ratio_fail_u16_3"),
-      "compression_ratio_u16_4": info.get("compression_ratio_fail_u16_4"),
-      "compression_ratio_fail_fp32": info.get("compression_ratio_fail_fp32"),
-      "key_fail_u16": info["key_fail_u16"],
-      "fail_ratio_jp2k_hat": info["fail_ratio_jp2k_hat"],
-      "fail_ratio_hat": info["fail_ratio_hat"],
-      "fail_ratio_fp32_hat": info["fail_ratio_fp32_hat"],
-      "compression_time": compression_time,
-      "decompression_time": decompression_time,
-      "compression_throughput": data_size / compression_time / (1024**2),
-      "decompression_throughput": data_size / decompression_time / (1024**2),
-    }
-    results.append(result)
-  return results
+  result = {
+    "variable": variable,
+    "year": year,
+    "month": month,
+    "ratio": ratio,
+    "cratio": cratio,
+    "data_size": data_size,
+    "check_passed": check_passed,
+    "compressed_size_jp2k": info["compressed_size_jp2k"],
+    "compressed_size_fail_u16": info["compressed_size_fail_u16"],
+    "compressed_size_fail_fp32": info["compressed_size_fail_fp32"],
+    "compressed_size": compressed_size,
+    "compression_ratio": compression_ratio,
+    "mse": mse,
+    "rmse": rmse,
+    "compression_ratio_u16_1": info.get("compression_ratio_fail_u16_1"),
+    "compression_ratio_u16_2": info.get("compression_ratio_fail_u16_2"),
+    "compression_ratio_u16_3": info.get("compression_ratio_fail_u16_3"),
+    "compression_ratio_u16_4": info.get("compression_ratio_fail_u16_4"),
+    "compression_ratio_fail_fp32": info.get("compression_ratio_fail_fp32"),
+    "key_fail_u16": info["key_fail_u16"],
+    "fail_ratio_jp2k_hat": info["fail_ratio_jp2k_hat"],
+    "fail_ratio_hat": info["fail_ratio_hat"],
+    "fail_ratio_fp32_hat": info["fail_ratio_fp32_hat"],
+    "compression_time": compression_time,
+    "decompression_time": decompression_time,
+    "compression_throughput": data_size / compression_time / (1024**2),
+    "decompression_throughput": data_size / decompression_time / (1024**2),
+  }
+  return result
 
 def run_search(
   era5_path,
@@ -92,6 +90,7 @@ def run_search(
   month,
   variable,
   ratio,
+  mode,
 ):
   reanalysis_file = os.path.join(era5_path, f"single_level/reanalysis/{year}/{month}/{variable}.npy")
   spread_file = os.path.join(era5_path, f"single_level/interpolated_ensemble_spread/{year}/{month}/{variable}.npy")
@@ -106,16 +105,22 @@ def run_search(
 
   codec = ErrorBoundedJP2KCodec()
 
-  steps = 8
-  data = data[:steps]
-  error_bound = error_bound[:steps]
+  steps = 6
+  data = data[::steps]
+  error_bound = error_bound[::steps]
 
   data_size = data.nbytes
 
-  results = []
-  print(f"Running search for {variable} ...")
+
+  # print(f"Running search for {variable} ...")
   compression_start_time = time.time()
-  (blob, info), best_cratio = codec.golden_section_search_best_compression(data, error_bound)
+  if mode == "full_scale":
+    (blob, info), best_cratio = codec.golden_section_search_best_compression(data, error_bound)
+  elif mode == "half_resolution":
+    (blob, info), best_cratio = codec.golden_section_search_best_compression(data[..., ::2, ::2], error_bound[..., ::2, ::2])
+  else:
+    raise ValueError(f"Unknown mode: {mode}")
+  blob, info = codec.compress(data, error_bound, best_cratio)
   compression_end_time = time.time()
   compression_time = compression_end_time - compression_start_time
 
@@ -135,6 +140,7 @@ def run_search(
     "year": year,
     "month": month,
     "ratio": ratio,
+    "mode": mode,
     "best_cratio": best_cratio,
     "data_size": data_size,
     "check_passed": check_passed,
@@ -155,14 +161,13 @@ def run_search(
     "compression_throughput": data_size / compression_time / (1024**2),
     "decompression_throughput": data_size / decompression_time / (1024**2),
   }
-  results.append(result)
-  return results
+  return result
 
 def main():
-  era5_path_np = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
+  era5_path = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
   year = '2024'
-  month = '12'
-  ratio = 0.5
+  month = '10'
+  ratio = 1
   variables = [
     # "100m_u_component_of_wind",
     # "100m_v_component_of_wind",
@@ -183,32 +188,54 @@ def main():
     # "total_precipitation",
   ]
 
-  # output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"scan_cratio_single_level_{year}_{month}_{ratio}.csv")
-  # results = []
-  # for variable in variables:
-  #   scan_results = run_scan(
-  #     era5_path=era5_path_np,
-  #     year=year,
-  #     month=month,
-  #     variable=variable,
-  #     ratio=ratio,
-  #   )
-  #   results.extend(scan_results)
-  #   pd.DataFrame(results).to_csv(output_csv, index=False)
-
-  output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"golden_section_search_single_level_{year}_{month}_{ratio}.csv")
+  num_processes = 16
+  pool = Pool(processes=num_processes)
   results = []
   for variable in variables:
-    scan_results = run_search(
-      era5_path=era5_path_np,
-      year=year,
-      month=month,
-      variable=variable,
-      ratio=ratio,
-    )
-    results.extend(scan_results)
-    pd.DataFrame(results).to_csv(output_csv, index=False)
+    for cratio in range(10, 61, 5):
+      args = (era5_path, year, month, variable, ratio, cratio)
+      if num_processes > 1:
+        result = pool.apply_async(run_scan, args=args)
+      else:
+        result = run_scan(*args)
+      results.append(result)
+  pool.close()
+  for idx in tqdm(range(len(results))):
+    result = results[idx]
+    if num_processes > 1:
+      result = result.get()
 
+    results[idx] = result
+    df = pd.DataFrame(results[:idx+1])
+    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/scan_cratio_single_level_{year}_{month}_{ratio}.csv")
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+  
+  pool.join()
+
+  pool = Pool(processes=num_processes)
+  results = []
+  for variable in variables:
+    for mode in ["full_scale", "half_resolution"]:
+      args = (era5_path, year, month, variable, ratio, mode)
+      if num_processes > 1:
+        result = pool.apply_async(run_search, args=args)
+      else:
+        result = run_search(*args)
+      results.append(result)
+  pool.close()
+  for idx in tqdm(range(len(results))):
+    result = results[idx]
+    if num_processes > 1:
+      result = result.get()
+
+    results[idx] = result
+    df = pd.DataFrame(results[:idx+1])
+    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/golden_section_search_single_level_{year}_{month}_{ratio}.csv")
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+
+  pool.join()
 
 if __name__ == "__main__":
   main()

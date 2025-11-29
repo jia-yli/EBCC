@@ -98,9 +98,9 @@ def plot_rmse(df, outdir):
 
 def main():
   ratio = 1
-  df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), f'scan_cratio_single_level_2024_12_{ratio}.csv'))
+  df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), f'results/scan_cratio_single_level_2024_12_{ratio}.csv'))
   df = df.sort_values(['variable', 'cratio']).reset_index(drop=True)
-  outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'plots_{ratio}')
+  outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'results/plots_{ratio}')
   os.makedirs(outdir, exist_ok=True)
 
   plot_fail_ratio_jp2k(df, outdir)
