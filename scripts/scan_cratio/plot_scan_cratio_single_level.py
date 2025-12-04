@@ -72,13 +72,33 @@ def plot_fail_ratio_jp2k(df, outdir):
 def plot_failed_points_compression_ratio(df, outdir):
   plot_per_variable_multi_lines(
     df, 
-    [f'compression_ratio_u16_{i}' for i in range(1, 5)], 
+    [f'compression_ratio_fail_u16_{i}' for i in range(1, 8)], 
     'Compression Ratio', 
     'Failed Points Compression Ratio', 
     outdir, 
     'failed_points_compression_ratio'
   )
 
+def plot_failed_points_index_compression_ratio(df, outdir):
+  plot_per_variable_multi_lines(
+    df, 
+    [f'compression_ratio_fail_idx_u16_{i}' for i in range(2, 8)], 
+    'Compression Ratio', 
+    'Failed Points Index Compression Ratio', 
+    outdir, 
+    'failed_points_index_compression_ratio'
+  )
+
+
+def plot_failed_points_value_compression_ratio(df, outdir):
+  outpath = os.path.join(outdir, 'failed_points_value_compression_ratio.png')
+  plot_all_variables_one_fig(
+    df, 
+    'compression_ratio_fail_val_u16', 
+    'Compression Ratio',
+    'Compression Ratio for Failed Points Values',
+    outpath
+  )
 
 def plot_overall_compression_ratio(df, outdir):
   outpath = os.path.join(outdir, 'compression_ratio.png')
@@ -98,14 +118,19 @@ def plot_rmse(df, outdir):
 
 def main():
   ratio = 1
-  df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), f'results/scan_cratio_single_level_2024_12_{ratio}.csv'))
+  df = pd.read_csv(os.path.join(os.path.dirname(os.path.abspath(__file__)), f'results/scan_cratio_single_level_2024_10_{ratio}.csv'))
   df = df.sort_values(['variable', 'cratio']).reset_index(drop=True)
   outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'results/plots_{ratio}')
   os.makedirs(outdir, exist_ok=True)
 
+  for i in range(2, 8):
+    df[f"compression_ratio_fail_idx_u16_{i}"] = 2/(1/df[f"compression_ratio_fail_u16_{i}"] - 1/df[f"compression_ratio_fail_val_u16"])
+
   plot_fail_ratio_jp2k(df, outdir)
   plot_sizes(df, outdir)
   plot_failed_points_compression_ratio(df, outdir)
+  plot_failed_points_index_compression_ratio(df, outdir)
+  plot_failed_points_value_compression_ratio(df, outdir)
   plot_overall_compression_ratio(df, outdir)
   plot_rmse(df, outdir)
 

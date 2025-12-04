@@ -68,10 +68,14 @@ def run_scan(
     "compression_ratio": compression_ratio,
     "mse": mse,
     "rmse": rmse,
-    "compression_ratio_u16_1": info.get("compression_ratio_fail_u16_1"),
-    "compression_ratio_u16_2": info.get("compression_ratio_fail_u16_2"),
-    "compression_ratio_u16_3": info.get("compression_ratio_fail_u16_3"),
-    "compression_ratio_u16_4": info.get("compression_ratio_fail_u16_4"),
+    "compression_ratio_fail_val_u16": info.get("compression_ratio_fail_val_u16"),
+    "compression_ratio_fail_u16_1": info.get("compression_ratio_fail_u16_1"),
+    "compression_ratio_fail_u16_2": info.get("compression_ratio_fail_u16_2"),
+    "compression_ratio_fail_u16_3": info.get("compression_ratio_fail_u16_3"),
+    "compression_ratio_fail_u16_4": info.get("compression_ratio_fail_u16_4"),
+    "compression_ratio_fail_u16_5": info.get("compression_ratio_fail_u16_5"),
+    "compression_ratio_fail_u16_6": info.get("compression_ratio_fail_u16_6"),
+    "compression_ratio_fail_u16_7": info.get("compression_ratio_fail_u16_7"),
     "compression_ratio_fail_fp32": info.get("compression_ratio_fail_fp32"),
     "key_fail_u16": info["key_fail_u16"],
     "fail_ratio_jp2k_hat": info["fail_ratio_jp2k_hat"],
@@ -167,7 +171,7 @@ def main():
   era5_path = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
   year = '2024'
   month = '10'
-  ratio = 1
+  ratio = 0.5
   variables = [
     # "100m_u_component_of_wind",
     # "100m_v_component_of_wind",
@@ -192,7 +196,7 @@ def main():
   pool = Pool(processes=num_processes)
   results = []
   for variable in variables:
-    for cratio in range(10, 61, 5):
+    for cratio in range(10, 101, 5):
       args = (era5_path, year, month, variable, ratio, cratio)
       if num_processes > 1:
         result = pool.apply_async(run_scan, args=args)
@@ -213,29 +217,29 @@ def main():
   
   pool.join()
 
-  pool = Pool(processes=num_processes)
-  results = []
-  for variable in variables:
-    for mode in ["full_scale", "half_resolution"]:
-      args = (era5_path, year, month, variable, ratio, mode)
-      if num_processes > 1:
-        result = pool.apply_async(run_search, args=args)
-      else:
-        result = run_search(*args)
-      results.append(result)
-  pool.close()
-  for idx in tqdm(range(len(results))):
-    result = results[idx]
-    if num_processes > 1:
-      result = result.get()
+  # pool = Pool(processes=num_processes)
+  # results = []
+  # for variable in variables:
+  #   for mode in ["full_scale"]:
+  #     args = (era5_path, year, month, variable, ratio, mode)
+  #     if num_processes > 1:
+  #       result = pool.apply_async(run_search, args=args)
+  #     else:
+  #       result = run_search(*args)
+  #     results.append(result)
+  # pool.close()
+  # for idx in tqdm(range(len(results))):
+  #   result = results[idx]
+  #   if num_processes > 1:
+  #     result = result.get()
 
-    results[idx] = result
-    df = pd.DataFrame(results[:idx+1])
-    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/golden_section_search_single_level_{year}_{month}_{ratio}.csv")
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
+  #   results[idx] = result
+  #   df = pd.DataFrame(results[:idx+1])
+  #   output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/golden_section_search_single_level_{year}_{month}_{ratio}.csv")
+  #   os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+  #   df.to_csv(output_csv, index=False)
 
-  pool.join()
+  # pool.join()
 
 if __name__ == "__main__":
   main()

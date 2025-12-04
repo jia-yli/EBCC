@@ -133,14 +133,16 @@ class ErrorBoundedJP2KCodec:
             fail_info_u16['compression_ratio_fail_u16_1'] = fail_count_jp2k_hat * 2 / (len(residual_q_w_bitstream) + 1e-8)
 
         # sparse residuals
-        if (key_fail_u16 is None) or (key_fail_u16 in ['2', '3', '4']):
+        if (key_fail_u16 is None) or (key_fail_u16 in ['2', '3', '4', '5', '6', '7']):
             non_zero_mask = residual_q_w != 0
             non_zero_val = residual_q_w[non_zero_mask].ravel()
-            non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
+            # non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
+            non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9)
+            non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
+            fail_info_u16["compression_ratio_fail_val_u16"] = (fail_count_jp2k_hat * 2 / len(non_zero_val_bitstream))
 
             if (key_fail_u16 is None) or (key_fail_u16 == '2'):
                 # idx + val
-                non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
                 non_zero_idx_bitstream = blosc.compress(non_zero_idx, typesize=4, cname="zstd", clevel=9)
                 bitstream_fail_u16_candidates['2'] = pickle.dumps(("2", non_zero_idx_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
                 fail_info_u16['compression_ratio_fail_u16_2'] = fail_count_jp2k_hat * 2 / (len(non_zero_idx_bitstream) + len(non_zero_val_bitstream) + 1e-8)
@@ -152,7 +154,6 @@ class ErrorBoundedJP2KCodec:
                 fail_info_u16['compression_ratio_fail_u16_3'] = fail_count_jp2k_hat * 2 / (len(non_zero_bitmask_bitstream) + len(non_zero_val_bitstream) + 1e-8)
             if (key_fail_u16 is None) or (key_fail_u16 == '4'):
                 # Use block id (uint16) + offset (uint16) + val
-                non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
                 block_size = 65536
                 n_blocks = (non_zero_mask.size + block_size - 1) // block_size
 
@@ -167,14 +168,85 @@ class ErrorBoundedJP2KCodec:
                 # print(fail_count_jp2k_hat * 2/len(block_idx_count_bitstream))
                 # print(fail_count_jp2k_hat * 2/len(block_idx_offset_bitstream))
                 # print(fail_count_jp2k_hat * 2/len(non_zero_val_bitstream))
+            
+            # NEW METHOD 5: Delta encoding with adaptive integer size
+            if (key_fail_u16 is None) or (key_fail_u16 == '5'):
+                # Compute deltas (first element is the actual index, rest are differences)
+                deltas = np.diff(non_zero_idx, prepend=0).astype(np.int32)
+                
+                # Determine optimal integer size based on max delta
+                max_delta = np.max(deltas)
+                if max_delta < 256:
+                    delta_dtype = np.uint8
+                    delta_size = 1
+                elif max_delta < 65536:
+                    delta_dtype = np.uint16
+                    delta_size = 2
+                else:
+                    delta_dtype = np.uint32
+                    delta_size = 4
+                
+                deltas_compressed = deltas.astype(delta_dtype)
+                deltas_bitstream = blosc.compress(deltas_compressed, typesize=delta_size, cname="zstd", clevel=9)
+                
+                bitstream_fail_u16_candidates['5'] = pickle.dumps(("5", delta_size, deltas_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
+                fail_info_u16['compression_ratio_fail_u16_5'] = fail_count_jp2k_hat * 2 / (len(deltas_bitstream) + len(non_zero_val_bitstream))
+            
+            # NEW METHOD 6: Hybrid delta encoding with overflow handling
+            if (key_fail_u16 is None) or (key_fail_u16 == '6'):
+                deltas = np.diff(non_zero_idx, prepend=0).astype(np.int32)
+                
+                # Use uint16 for most deltas, with special marker for overflows
+                OVERFLOW_MARKER = 65535
+                small_deltas = []
+                overflow_positions = []
+                overflow_values = []
+                
+                for i, d in enumerate(deltas):
+                    if d < OVERFLOW_MARKER:
+                        small_deltas.append(d)
+                    else:
+                        small_deltas.append(OVERFLOW_MARKER)
+                        overflow_positions.append(i)
+                        overflow_values.append(d)
+                
+                small_deltas_arr = np.array(small_deltas, dtype=np.uint16)
+                small_deltas_bitstream = blosc.compress(small_deltas_arr, typesize=2, cname="zstd", clevel=9)
+                
+                overflow_pos_arr = np.array(overflow_positions, dtype=np.int32)
+                overflow_val_arr = np.array(overflow_values, dtype=np.int32)
+                overflow_pos_bitstream = blosc.compress(overflow_pos_arr, typesize=4, cname="zstd", clevel=9)
+                overflow_val_bitstream = blosc.compress(overflow_val_arr, typesize=4, cname="zstd", clevel=9)
+                
+                bitstream_fail_u16_candidates['6'] = pickle.dumps(("6", small_deltas_bitstream, overflow_pos_bitstream, overflow_val_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
+                fail_info_u16['compression_ratio_fail_u16_6'] = fail_count_jp2k_hat * 2 / (len(small_deltas_bitstream) + len(overflow_pos_bitstream) + len(overflow_val_bitstream) + len(non_zero_val_bitstream))
+            
+            # NEW METHOD 7: Variable-byte encoding (VByte)
+            if (key_fail_u16 is None) or (key_fail_u16 == '7'):
+                deltas = np.diff(non_zero_idx, prepend=0).astype(np.int32)
+                
+                # Encode using variable-byte encoding (similar to UTF-8)
+                # Each byte uses 7 bits for data and 1 bit as continuation flag
+                vbyte_encoded = []
+                for delta in deltas:
+                    while delta >= 128:
+                        vbyte_encoded.append((delta & 0x7F) | 0x80)
+                        delta >>= 7
+                    vbyte_encoded.append(delta & 0x7F)
+                
+                vbyte_arr = np.array(vbyte_encoded, dtype=np.uint8)
+                vbyte_bitstream = blosc.compress(vbyte_arr.tobytes(), typesize=1, cname="zstd", clevel=9)
+                
+                bitstream_fail_u16_candidates['7'] = pickle.dumps(("7", vbyte_bitstream, non_zero_val_bitstream), protocol=pickle.HIGHEST_PROTOCOL)
+                fail_info_u16['compression_ratio_fail_u16_7'] = fail_count_jp2k_hat * 2 / (len(vbyte_bitstream) + len(non_zero_val_bitstream))
         
         assert len(bitstream_fail_u16_candidates) > 0, "No failure handling methods generated."
         # choose best
         key_fail_u16, bitstream_fail_u16 = min(bitstream_fail_u16_candidates.items(), key=lambda kv: len(kv[1]))
-        # assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
+        assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
 
         fail_count_hat = int(np.count_nonzero(np.abs(data_u16.astype(np.int32) - data_u16_hat.astype(np.int32)) > err_u16.astype(np.int32)))
-        compression_ratio_fail_u16 = fail_count_jp2k_hat * 2 / (len(bitstream_fail_u16) + 1e-8)
+        compression_ratio_fail_u16 = fail_count_jp2k_hat * 2 / (len(bitstream_fail_u16))
 
         fail_info_u16.update({
             "fail_ratio_jp2k_hat": fail_count_jp2k_hat/data_u16.size,
@@ -229,6 +301,71 @@ class ErrorBoundedJP2KCodec:
             non_zero_idx = block_idx * block_size + block_idx_offset.astype(np.int32)
             non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
 
+            residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
+            residual_q_w[non_zero_idx] = non_zero_val
+            residual_q_w = residual_q_w.reshape(shape)
+        elif key_fail_u16 == "5":
+            # Delta encoding with adaptive integer size
+            delta_size, deltas_bitstream, non_zero_val_bitstream = payload
+            
+            if delta_size == 1:
+                delta_dtype = np.uint8
+            elif delta_size == 2:
+                delta_dtype = np.uint16
+            else:
+                delta_dtype = np.uint32
+            
+            deltas = np.frombuffer(blosc.decompress(deltas_bitstream), dtype=delta_dtype).astype(np.int32)
+            non_zero_idx = np.cumsum(deltas)
+            non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
+            
+            residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
+            residual_q_w[non_zero_idx] = non_zero_val
+            residual_q_w = residual_q_w.reshape(shape)
+        elif key_fail_u16 == "6":
+            # Hybrid delta encoding with overflow handling
+            small_deltas_bitstream, overflow_pos_bitstream, overflow_val_bitstream, non_zero_val_bitstream = payload
+            
+            small_deltas = np.frombuffer(blosc.decompress(small_deltas_bitstream), dtype=np.uint16).astype(np.int32)
+            
+            # Handle overflows
+            if len(overflow_pos_bitstream) > 0:
+                overflow_positions = np.frombuffer(blosc.decompress(overflow_pos_bitstream), dtype=np.int32)
+                overflow_values = np.frombuffer(blosc.decompress(overflow_val_bitstream), dtype=np.int32)
+                
+                for pos, val in zip(overflow_positions, overflow_values):
+                    small_deltas[pos] = val
+            
+            non_zero_idx = np.cumsum(small_deltas)
+            non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
+            
+            residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
+            residual_q_w[non_zero_idx] = non_zero_val
+            residual_q_w = residual_q_w.reshape(shape)
+        elif key_fail_u16 == "7":
+            # Variable-byte encoding
+            vbyte_bitstream, non_zero_val_bitstream = payload
+            
+            vbyte_arr = np.frombuffer(blosc.decompress(vbyte_bitstream), dtype=np.uint8)
+            
+            # Decode variable-byte encoding
+            deltas = []
+            value = 0
+            shift = 0
+            for byte in vbyte_arr:
+                byte = int(byte) # Ensure python int to avoid numpy overflow during shift
+                value |= (byte & 0x7F) << shift
+                if (byte & 0x80) == 0:
+                    # No continuation bit, value complete
+                    deltas.append(value)
+                    value = 0
+                    shift = 0
+                else:
+                    shift += 7
+            
+            non_zero_idx = np.cumsum(np.array(deltas, dtype=np.int32))
+            non_zero_val = np.frombuffer(blosc.decompress(non_zero_val_bitstream), dtype=np.uint16)
+            
             residual_q_w = np.zeros(int(np.prod(shape)), dtype=np.uint16)
             residual_q_w[non_zero_idx] = non_zero_val
             residual_q_w = residual_q_w.reshape(shape)
@@ -302,7 +439,7 @@ class ErrorBoundedJP2KCodec:
         data_u16_jp2k_hat = self._decode_jp2k_u16(bitstream_jp2k)
 
         bitstream_fail_u16, data_u16_hat, fail_info_u16 = self._extract_failures_u16(data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16=key_fail_u16)
-        # print(f"U16 Failures: {fail_info_u16}")
+        print(f"U16 Failures: {fail_info_u16}")
 
         # final checks
         data_fp32_hat = self._minmax_scale_from_u16(data_u16_hat, dmin, dmax)
@@ -320,7 +457,7 @@ class ErrorBoundedJP2KCodec:
         info = fail_info_u16 | fail_info_fp32
         info["compressed_size_jp2k"] = len(bitstream_jp2k)
         total_size = len(bitstream_jp2k) + len(bitstream_fail_u16) + len(bitstream_fail_fp32)
-        # print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
+        print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
         return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), info
 
     def decompress(self, blob):
@@ -342,95 +479,95 @@ class ErrorBoundedJP2KCodec:
 
         return data_fp32_hat
 
-    def grid_search_best_compression(self, data, error_bound):
-        cratio_step = 5
-        cratio_start = 50
-        stop_counts = 2
-        assert stop_counts >= 1
+    # def grid_search_best_compression(self, data, error_bound):
+    #     cratio_step = 5
+    #     cratio_start = 50
+    #     stop_counts = 2
+    #     assert stop_counts >= 1
 
-        best_cratio = cratio_start
-        best_result = self.compress(data, error_bound, best_cratio)
-        best_compression_ratio = data.nbytes / len(best_result[0])
+    #     best_cratio = cratio_start
+    #     best_result = self.compress(data, error_bound, best_cratio)
+    #     best_compression_ratio = data.nbytes / len(best_result[0])
 
-        # go right
-        current_cratio = best_cratio
-        stop_counter = 0
-        while True:
-            current_cratio += cratio_step
-            result = self.compress(data, error_bound, current_cratio)
-            compression_ratio = data.nbytes / len(result[0])
-            if compression_ratio > best_compression_ratio:
-                # update best
-                best_cratio = current_cratio
-                best_result = result
-                best_compression_ratio = compression_ratio
-                # reset stop counter
-                stop_counter = 0
-            else:
-                # increment stop counter
-                stop_counter += 1
-                if stop_counter >= stop_counts:
-                    break
+    #     # go right
+    #     current_cratio = best_cratio
+    #     stop_counter = 0
+    #     while True:
+    #         current_cratio += cratio_step
+    #         result = self.compress(data, error_bound, current_cratio)
+    #         compression_ratio = data.nbytes / len(result[0])
+    #         if compression_ratio > best_compression_ratio:
+    #             # update best
+    #             best_cratio = current_cratio
+    #             best_result = result
+    #             best_compression_ratio = compression_ratio
+    #             # reset stop counter
+    #             stop_counter = 0
+    #         else:
+    #             # increment stop counter
+    #             stop_counter += 1
+    #             if stop_counter >= stop_counts:
+    #                 break
 
-        # go left
-        current_cratio = best_cratio
-        stop_counter = 0
-        while True:
-            current_cratio -= cratio_step
-            if current_cratio < cratio_step:
-                break
-            result = self.compress(data, error_bound, current_cratio)
-            compression_ratio = data.nbytes / len(result[0])
-            if compression_ratio > best_compression_ratio:
-                # update best
-                best_cratio = current_cratio
-                best_result = result
-                best_compression_ratio = compression_ratio
-                # reset stop counter
-                stop_counter = 0
-            else:
-                # increment stop counter
-                stop_counter += 1
-                if stop_counter >= stop_counts:
-                    break
+    #     # go left
+    #     current_cratio = best_cratio
+    #     stop_counter = 0
+    #     while True:
+    #         current_cratio -= cratio_step
+    #         if current_cratio < cratio_step:
+    #             break
+    #         result = self.compress(data, error_bound, current_cratio)
+    #         compression_ratio = data.nbytes / len(result[0])
+    #         if compression_ratio > best_compression_ratio:
+    #             # update best
+    #             best_cratio = current_cratio
+    #             best_result = result
+    #             best_compression_ratio = compression_ratio
+    #             # reset stop counter
+    #             stop_counter = 0
+    #         else:
+    #             # increment stop counter
+    #             stop_counter += 1
+    #             if stop_counter >= stop_counts:
+    #                 break
 
-        return best_result, best_cratio
+    #     return best_result, best_cratio
     
-    def grid_search_target_compression(self, data, error_bound, target_compression_ratio):
-        cratio_step = 5
-        cratio_start = cratio_step
-        stop_counts = 2
-        assert stop_counts >= 1
+    # def grid_search_target_compression(self, data, error_bound, target_compression_ratio):
+    #     cratio_step = 5
+    #     cratio_start = cratio_step
+    #     stop_counts = 2
+    #     assert stop_counts >= 1
 
-        closest_cratio = cratio_start
-        closest_result = self.compress(data, error_bound, closest_cratio)
-        closest_compression_ratio = data.nbytes / len(closest_result[0])
+    #     closest_cratio = cratio_start
+    #     closest_result = self.compress(data, error_bound, closest_cratio)
+    #     closest_compression_ratio = data.nbytes / len(closest_result[0])
 
-        # go right
-        current_cratio = closest_cratio
-        stop_counter = 0
-        while True:
-            current_cratio += cratio_step
-            result = self.compress(data, error_bound, current_cratio)
-            compression_ratio = data.nbytes / len(result[0])
-            if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
-                closest_cratio = current_cratio
-                closest_result = result
-                closest_compression_ratio = compression_ratio
-                # reset stop counter
-                stop_counter = 0
-            else:
-                # increment stop counter
-                stop_counter += 1
-                if stop_counter >= stop_counts:
-                    break
+    #     # go right
+    #     current_cratio = closest_cratio
+    #     stop_counter = 0
+    #     while True:
+    #         current_cratio += cratio_step
+    #         result = self.compress(data, error_bound, current_cratio)
+    #         compression_ratio = data.nbytes / len(result[0])
+    #         if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
+    #             closest_cratio = current_cratio
+    #             closest_result = result
+    #             closest_compression_ratio = compression_ratio
+    #             # reset stop counter
+    #             stop_counter = 0
+    #         else:
+    #             # increment stop counter
+    #             stop_counter += 1
+    #             if stop_counter >= stop_counts:
+    #                 break
 
-        return closest_result, closest_cratio
+    #     return closest_result, closest_cratio
 
     def golden_section_search_best_compression(self, data, error_bound):
         cratio_step = 5
         min_cratio = cratio_step // 2
-        max_cratio = 200
+        max_cratio = 400
 
         phi = (1 + math.sqrt(5)) / 2
 
@@ -495,11 +632,9 @@ class ErrorBoundedJP2KCodec:
     def run_benchmark_best_compression(data, error_bound):
         codec = ErrorBoundedJP2KCodec()
 
-        _, best_cratio = codec.grid_search_best_compression(data, error_bound)
-
         # Time final compression (re-run for timing consistency)
         compression_start_time = time.time()
-        bitstream, info = codec.compress(data, error_bound, best_cratio)
+        (bitstream, info), best_cratio = codec.golden_section_search_best_compression(data, error_bound)
         compression_time = time.time() - compression_start_time
 
         # Time decompression
