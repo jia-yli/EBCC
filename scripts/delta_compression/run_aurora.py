@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from datetime import datetime, timedelta
-from joblib import Memory
+from joblib import Memory, Parallel, delayed
 
 from ebcc_wrapper import ErrorBoundedJP2KCodec
 from aurora import Aurora, Batch, Metadata
@@ -92,33 +92,63 @@ def create_batch_from_data(surf_vars, static_vars, atmos_vars,
         ),
     )
 
-def compress_all_variables_at_step(codec, all_data, all_spread, step):
-    """Compress all variables at a given step together."""
-    # Collect all data and error bounds at this step
-    total_bytes = 0
-    compressed_blobs = []
+def compress_single_variable(var_name, slice_data, slice_eb):
+    """Compress a single variable slice."""
+    codec = ErrorBoundedJP2KCodec()
     
-    for var_name, data in all_data.items():
-        slice_data = data[step]  # Shape varies by variable type
-        slice_eb = all_spread[var_name][step]
-        
-        (compressed_blob, info), cratio = codec.golden_section_search_best_compression(slice_data[None], slice_eb[None])
-        compressed_blobs.append((var_name, compressed_blob, slice_data.shape))
-        
-        total_bytes += slice_data.nbytes
+    # Reshape to [N, H, W] if needed
+    if slice_data.ndim == 3:  # [P, H, W]
+        data_2d = slice_data.reshape(-1, slice_data.shape[-2], slice_data.shape[-1])
+        eb_2d = slice_eb.reshape(-1, slice_eb.shape[-2], slice_eb.shape[-1])
+    else:  # [H, W]
+        assert slice_data.ndim == 2
+        data_2d = slice_data[None]  # [1, H, W]
+        eb_2d = slice_eb[None]
     
-    # Calculate total compressed size
+    (compressed_blob, info), cratio = codec.golden_section_search_best_compression(data_2d, eb_2d)
+    return var_name, compressed_blob, slice_data.shape, slice_data.nbytes
+
+def compress_all_variables_at_step(codec, all_data, all_spread, step, n_jobs=8):
+    """Compress all variables at a given step together using multiprocessing."""
+    # Prepare tasks for parallel compression
+    tasks = [(var_name, data[step], all_spread[var_name][step]) 
+             for var_name, data in all_data.items()]
+    
+    # Compress in parallel
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(compress_single_variable)(var_name, slice_data, slice_eb)
+        for var_name, slice_data, slice_eb in tasks
+    )
+    
+    # Collect results
+    compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _ in results]
+    total_bytes = sum(nbytes for _, _, _, nbytes in results)
     total_compressed = sum(len(blob) for _, blob, _ in compressed_blobs)
     compression_ratio = total_bytes / total_compressed
     
     return compressed_blobs, compression_ratio
 
-def decompress_all_variables_at_step(codec, compressed_blobs):
-    """Decompress all variables at a given step."""
-    decompressed = {}
-    for var_name, blob, shape in compressed_blobs:
-        dec = codec.decompress(blob)[0]
-        decompressed[var_name] = dec
+def decompress_single_variable(var_name, blob, shape):
+    """Decompress a single variable."""
+    codec = ErrorBoundedJP2KCodec()
+    dec = codec.decompress(blob)  # Returns [N, H, W]
+    
+    # Reshape back to original shape
+    if len(shape) == 3:  # [P, H, W]
+        dec = dec.reshape(shape)
+    else:  # [H, W]
+        dec = dec[0]  # Remove batch dimension
+    
+    return var_name, dec
+
+def decompress_all_variables_at_step(codec, compressed_blobs, n_jobs=8):
+    """Decompress all variables at a given step using multiprocessing."""
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(decompress_single_variable)(var_name, blob, shape)
+        for var_name, blob, shape in compressed_blobs
+    )
+    
+    decompressed = {var_name: dec for var_name, dec in results}
     return decompressed
 
 def aurora_predictive_compression(era5_root, year, month, num_steps):
@@ -216,42 +246,48 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
             total_bytes = 0
             compressed_blobs = []
             
+            # Prepare residuals for all variables
+            residual_tasks = []
+            
             # Surface variables
             for var_name in ["t2m", "u10", "v10", "msl"]:
                 aurora_name = var_map[var_name]
-                pred_data = pred.surf_vars[aurora_name][0, 0].cpu().numpy() # [1, 1, H, W]
+                pred_data = pred.surf_vars[aurora_name][0, 0].cpu().numpy() # [H, W]
                 true_data = all_data[var_name][step]
                 residual = true_data - pred_data
-                
                 slice_eb = all_spread[var_name][step]
-                compressed_blob, info = codec.golden_section_search_best_compression(residual[None], slice_eb[None])
-                compressed_blobs.append((var_name, compressed_blob, residual.shape))
-                
+                residual_tasks.append((var_name, residual, slice_eb))
                 total_bytes += true_data.nbytes
             
             # Atmospheric variables
             for var_name in ["temperature", "u_component_of_wind", "v_component_of_wind",
                            "specific_humidity", "geopotential"]:
                 aurora_name = var_map[var_name]
-                pred_data = pred.atmos_vars[aurora_name][0, 0].cpu().numpy()
+                pred_data = pred.atmos_vars[aurora_name][0, 0].cpu().numpy() # [P, H, W]
                 true_data = all_data[var_name][step]
                 residual = true_data - pred_data
-                
                 slice_eb = all_spread[var_name][step]
-                compressed_blob, info = codec.golden_section_search_best_compression(residual[None], slice_eb[None])
-                compressed_blobs.append((var_name, compressed_blob, residual.shape))
-                
+                residual_tasks.append((var_name, residual, slice_eb))
                 total_bytes += true_data.nbytes
+            
+            # Compress all residuals in parallel
+            results = Parallel(n_jobs=8)(
+                delayed(compress_single_variable)(var_name, residual, slice_eb)
+                for var_name, residual, slice_eb in residual_tasks
+            )
+            
+            compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _ in results]
             
             # Calculate compression ratio for all variables at this step
             total_compressed = sum(len(blob) for _, blob, _ in compressed_blobs)
             cr = total_bytes / total_compressed
             compression_ratios.append(cr)
             
-            # Decompress residuals and reconstruct
-            for var_name, blob, shape in compressed_blobs:
-                decompressed_residual = codec.decompress(blob)[0]
-                
+            # Decompress residuals in parallel
+            decompressed_residuals = decompress_all_variables_at_step(codec, compressed_blobs, n_jobs=8)
+            
+            # Reconstruct using predictions
+            for var_name, decompressed_residual in decompressed_residuals.items():
                 # Get prediction
                 if var_name in ["t2m", "u10", "v10", "msl"]:
                     aurora_name = var_map[var_name]
