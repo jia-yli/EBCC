@@ -17,16 +17,13 @@ def load_all_data(era5_root, year, month, pressure_levels, num_steps):
     all_data = {}
     all_spread = {}
     
-    # Surface variables
-    for var in ["t2m", "u10", "v10", "msl", "z", "slt", "lsm"]:
+    # Surface variables (time-varying)
+    for var in ["t2m", "u10", "v10", "msl"]:
         single_level_filenames = {
             "t2m": "2m_temperature",
             "u10": "10m_u_component_of_wind",
             "v10": "10m_v_component_of_wind",
             "msl": "mean_sea_level_pressure",
-            "z": "geopotential",
-            "slt": "soil_type",
-            "lsm": "land_sea_mask",
         }
         variable = single_level_filenames[var]
         data = np.load(os.path.join(era5_root, f"single_level/reanalysis/{year}/{month}/{variable}.npy"))
@@ -37,6 +34,19 @@ def load_all_data(era5_root, year, month, pressure_levels, num_steps):
         spread = spread[::6][:num_steps][..., :-1, :]
         all_data[var] = data
         all_spread[var] = spread
+    
+    # Static variables (constants - not compressed)
+    static_data = {}
+    for var in ["z", "slt", "lsm"]:
+        single_level_filenames = {
+            "z": "geopotential",
+            "slt": "soil_type",
+            "lsm": "land_sea_mask",
+        }
+        variable = single_level_filenames[var]
+        data = np.load(os.path.join(era5_root, f"single_level/reanalysis/{year}/{month}/{variable}.npy"))
+        # Take first timestep and crop
+        static_data[var] = data[0, :-1, :]
     
     # Atmospheric variables
     for var in ["temperature", "u_component_of_wind", "v_component_of_wind", 
@@ -59,7 +69,7 @@ def load_all_data(era5_root, year, month, pressure_levels, num_steps):
         spread = np.concatenate(spread_lst, axis=1)
         all_data[var] = data
         all_spread[var] = spread
-    return all_data, all_spread
+    return all_data, all_spread, static_data
 
 def create_batch_from_data(surf_vars, static_vars, atmos_vars, 
                            lat, lon, time_start, pressure_levels, step_idx):
@@ -106,7 +116,9 @@ def compress_single_variable(var_name, slice_data, slice_eb):
         eb_2d = slice_eb[None]
     
     (compressed_blob, info), cratio = codec.golden_section_search_best_compression(data_2d, eb_2d)
-    return var_name, compressed_blob, slice_data.shape, slice_data.nbytes
+    # Return compression ratio for this variable
+    var_cr = slice_data.nbytes / len(compressed_blob)
+    return var_name, compressed_blob, slice_data.shape, slice_data.nbytes, var_cr
 
 def compress_all_variables_at_step(codec, all_data, all_spread, step, n_jobs=8):
     """Compress all variables at a given step together using multiprocessing."""
@@ -121,12 +133,13 @@ def compress_all_variables_at_step(codec, all_data, all_spread, step, n_jobs=8):
     )
     
     # Collect results
-    compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _ in results]
-    total_bytes = sum(nbytes for _, _, _, nbytes in results)
+    compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _, _ in results]
+    var_compression_ratios = {var_name: var_cr for var_name, _, _, _, var_cr in results}
+    total_bytes = sum(nbytes for _, _, _, nbytes, _ in results)
     total_compressed = sum(len(blob) for _, blob, _ in compressed_blobs)
     compression_ratio = total_bytes / total_compressed
     
-    return compressed_blobs, compression_ratio
+    return compressed_blobs, compression_ratio, var_compression_ratios
 
 def decompress_single_variable(var_name, blob, shape):
     """Decompress a single variable."""
@@ -170,7 +183,7 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
     print(f"Loading all variables")
     print(f"{'='*60}")
     
-    all_data, all_spread = load_all_data(era5_root, year, month, pressure_levels, num_steps)
+    all_data, all_spread, static_data = load_all_data(era5_root, year, month, pressure_levels, num_steps)
     
     # Map variable names to Aurora names
     var_map = {
@@ -186,15 +199,21 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
     time_start = datetime(int(year), int(month), 1, 0, 0, 0)
     
     compression_ratios = []
+    # Track compression ratios for each variable at each step (excluding static variables)
+    var_compression_history = {var_name: [] for var_name in all_data.keys()}
     decompressed_data = {k: v.copy() for k, v in all_data.items()}
     
     # Steps 0 and 1: Direct compression of all variables
     for step in range(min(2, num_steps)):
         print(f"\nStep {step}: Direct compression of all variables")
         
-        compressed_blobs, cr = compress_all_variables_at_step(
+        compressed_blobs, cr, var_crs = compress_all_variables_at_step(
             codec, all_data, all_spread, step
         )
+        
+        # Store per-variable compression ratios
+        for var_name, var_cr in var_crs.items():
+            var_compression_history[var_name].append(var_cr)
         
         # Decompress to maintain state
         decompressed = decompress_all_variables_at_step(codec, compressed_blobs)
@@ -218,9 +237,9 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
             }
             
             static_vars = {
-                "z": all_data["z"][0],
-                "slt": all_data["slt"][0],
-                "lsm": all_data["lsm"][0],
+                "z": static_data["z"],
+                "slt": static_data["slt"],
+                "lsm": static_data["lsm"],
             }
             
             atmos_vars = {
@@ -276,7 +295,11 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
                 for var_name, residual, slice_eb in residual_tasks
             )
             
-            compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _ in results]
+            compressed_blobs = [(var_name, blob, shape) for var_name, blob, shape, _, _ in results]
+            
+            # Store per-variable compression ratios
+            for var_name, _, _, _, var_cr in results:
+                var_compression_history[var_name].append(var_cr)
             
             # Calculate compression ratio for all variables at this step
             total_compressed = sum(len(blob) for _, blob, _ in compressed_blobs)
@@ -301,7 +324,7 @@ def aurora_predictive_compression(era5_root, year, month, num_steps):
             
             print(f"  Overall compression ratio: {cr:.2f}")
     
-    return compression_ratios
+    return compression_ratios, var_compression_history
 
 def main():
     era5_root = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
@@ -310,7 +333,7 @@ def main():
     
     num_steps = 8  # Number of 6-hour steps
     
-    compression_ratios = aurora_predictive_compression(
+    compression_ratios, var_compression_history = aurora_predictive_compression(
         era5_root, year, month, num_steps
     )
     
@@ -322,16 +345,27 @@ def main():
         print(f"  Step {i}: {cr:.2f}")
     
     # Save to CSV
-    output_dir = os.path.join(os.path.dirname(__file__), "results")
+    output_dir = os.path.join(os.path.dirname(__file__), "results_aurora")
     os.makedirs(output_dir, exist_ok=True)
     
-    df = pd.DataFrame({
+    # Save per-variable compression ratios
+    for var_name, ratios in var_compression_history.items():
+        df = pd.DataFrame({
+            'step': range(len(ratios)),
+            'compression_ratio': ratios
+        })
+        output_csv = os.path.join(output_dir, f"{var_name}_compression_ratios.csv")
+        df.to_csv(output_csv, index=False)
+        print(f"\nSaved {var_name} results to {output_csv}")
+    
+    # Also save overall compression ratios
+    df_overall = pd.DataFrame({
         'step': range(len(compression_ratios)),
         'compression_ratio': compression_ratios
     })
-    output_csv = os.path.join(output_dir, "aurora_compression_all_variables.csv")
-    df.to_csv(output_csv, index=False)
-    print(f"\nSaved results to {output_csv}")
+    output_csv_overall = os.path.join(output_dir, "overall_compression_ratios.csv")
+    df_overall.to_csv(output_csv_overall, index=False)
+    print(f"\nSaved overall results to {output_csv_overall}")
 
 if __name__ == "__main__":
     main()
