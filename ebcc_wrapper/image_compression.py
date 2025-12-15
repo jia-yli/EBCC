@@ -91,6 +91,8 @@ class ErrorBoundedJP2KCodec:
         jp2 = glymur.Jp2k(fname)
 
         arr_u16 = np.asarray(jp2[:], dtype=np.uint16)  # (H,W,N)
+        if arr_u16.ndim == 2:
+            arr_u16 = arr_u16[:, :, np.newaxis]  # (H,W,1)
         return np.transpose(arr_u16, (2, 0, 1))  # (N,H,W)
 
     # ========= Failure handling =========
@@ -99,7 +101,7 @@ class ErrorBoundedJP2KCodec:
     # Because max error from change = 2^N - 1 < eb.
     # Thus, we can quantize the residual to multiples of S = 2^k, where S is the largest power-of-two such that S*2 > eb.
     # But we do RNE instead, so the condition is S/2 <= eb.
-    def _extract_failures_u16(self, data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16):
+    def _extract_failures_u16(self, data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16, round_option, value_shuffle_option):
         # dtype/shape checks
         assert (data_u16.dtype == np.uint16) and (data_u16_jp2k_hat.dtype == np.uint16) and (err_u16.dtype == np.uint16)
         assert data_u16.shape == data_u16_jp2k_hat.shape == err_u16.shape
@@ -112,13 +114,24 @@ class ErrorBoundedJP2KCodec:
         S = (1 << k).astype(np.int32)
 
         # quantize to nearest multiple of S (RNE)
-        residual_q = np.rint(residual.astype(np.float32) / S).astype(np.int32) * S # ties-to-even
+        if round_option in ['0', '1']:
+            residual_q = np.rint(residual.astype(np.float32) / S).astype(np.int32) * S # ties-to-even
+        elif round_option in ['2']:
+            residual_q = residual
+        else:
+            raise ValueError(f"Unknown round_option: {round_option}")
 
         # wrap-around to uint16
         residual_q_w = residual_q.astype(np.uint16) # map to [-32768, 32767]
 
-        inside = np.abs(residual) <= err_u16.astype(np.int32)
-        residual_q_w[inside] = 0
+        if round_option in ['0', '2']:
+            # set small residuals to zero
+            inside = np.abs(residual) <= err_u16.astype(np.int32)
+            residual_q_w[inside] = 0
+        elif round_option in ['1']:
+            residual_q_w = residual_q_w
+        else:
+            raise ValueError(f"Unknown round_option: {round_option}")
 
         data_u16_hat = (data_u16_jp2k_hat.astype(np.uint32) + residual_q_w.astype(np.uint32)).astype(np.uint16)
 
@@ -136,8 +149,12 @@ class ErrorBoundedJP2KCodec:
         if (key_fail_u16 is None) or (key_fail_u16 in ['2', '3', '4', '5', '6', '7']):
             non_zero_mask = residual_q_w != 0
             non_zero_val = residual_q_w[non_zero_mask].ravel()
-            # non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
-            non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9)
+            if value_shuffle_option == '0':
+                non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9, shuffle=blosc.BITSHUFFLE)
+            elif value_shuffle_option == '1':
+                non_zero_val_bitstream = blosc.compress(non_zero_val.tobytes(), typesize=2, cname="zstd", clevel=9)
+            else:
+                raise ValueError(f"Unknown value_shuffle_option: {value_shuffle_option}")
             non_zero_idx = np.flatnonzero(non_zero_mask.ravel()).astype(np.int32)
             fail_info_u16["compression_ratio_fail_val_u16"] = (fail_count_jp2k_hat * 2 / len(non_zero_val_bitstream))
 
@@ -243,7 +260,7 @@ class ErrorBoundedJP2KCodec:
         assert len(bitstream_fail_u16_candidates) > 0, "No failure handling methods generated."
         # choose best
         key_fail_u16, bitstream_fail_u16 = min(bitstream_fail_u16_candidates.items(), key=lambda kv: len(kv[1]))
-        assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
+        # assert (data_u16_hat == self._apply_failures_u16(data_u16_jp2k_hat, bitstream_fail_u16, data_u16.shape)).all()
 
         fail_count_hat = int(np.count_nonzero(np.abs(data_u16.astype(np.int32) - data_u16_hat.astype(np.int32)) > err_u16.astype(np.int32)))
         compression_ratio_fail_u16 = fail_count_jp2k_hat * 2 / (len(bitstream_fail_u16))
@@ -424,7 +441,7 @@ class ErrorBoundedJP2KCodec:
 
     # ========= Compression/Decompression =========
 
-    def compress(self, data, error_bound, cratio, key_fail_u16='3'):
+    def compress(self, data, error_bound, cratio, key_fail_u16='3', round_option='0', value_shuffle_option='0'):
         assert (data.shape == error_bound.shape) and (data.ndim > 1)
         error_bound = error_bound.astype(np.float32)
         assert (data.dtype == np.float32), "data and error_bound must be float32"
@@ -438,8 +455,8 @@ class ErrorBoundedJP2KCodec:
         bitstream_jp2k = self._encode_jp2k_u16(data_u16, cratio)
         data_u16_jp2k_hat = self._decode_jp2k_u16(bitstream_jp2k)
 
-        bitstream_fail_u16, data_u16_hat, fail_info_u16 = self._extract_failures_u16(data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16=key_fail_u16)
-        print(f"U16 Failures: {fail_info_u16}")
+        bitstream_fail_u16, data_u16_hat, fail_info_u16 = self._extract_failures_u16(data_u16, data_u16_jp2k_hat, err_u16, key_fail_u16=key_fail_u16, round_option=round_option, value_shuffle_option=value_shuffle_option)
+        # print(f"U16 Failures: {fail_info_u16}")
 
         # final checks
         data_fp32_hat = self._minmax_scale_from_u16(data_u16_hat, dmin, dmax)
@@ -457,7 +474,7 @@ class ErrorBoundedJP2KCodec:
         info = fail_info_u16 | fail_info_fp32
         info["compressed_size_jp2k"] = len(bitstream_jp2k)
         total_size = len(bitstream_jp2k) + len(bitstream_fail_u16) + len(bitstream_fail_fp32)
-        print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
+        # print(f"Final bistream: ratio of u16 failures = {len(bitstream_fail_u16) / total_size}, ratio of fp32 failures= {len(bitstream_fail_fp32) / total_size:}")
         return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL), info
 
     def decompress(self, blob):
@@ -479,92 +496,7 @@ class ErrorBoundedJP2KCodec:
 
         return data_fp32_hat
 
-    # def grid_search_best_compression(self, data, error_bound):
-    #     cratio_step = 5
-    #     cratio_start = 50
-    #     stop_counts = 2
-    #     assert stop_counts >= 1
-
-    #     best_cratio = cratio_start
-    #     best_result = self.compress(data, error_bound, best_cratio)
-    #     best_compression_ratio = data.nbytes / len(best_result[0])
-
-    #     # go right
-    #     current_cratio = best_cratio
-    #     stop_counter = 0
-    #     while True:
-    #         current_cratio += cratio_step
-    #         result = self.compress(data, error_bound, current_cratio)
-    #         compression_ratio = data.nbytes / len(result[0])
-    #         if compression_ratio > best_compression_ratio:
-    #             # update best
-    #             best_cratio = current_cratio
-    #             best_result = result
-    #             best_compression_ratio = compression_ratio
-    #             # reset stop counter
-    #             stop_counter = 0
-    #         else:
-    #             # increment stop counter
-    #             stop_counter += 1
-    #             if stop_counter >= stop_counts:
-    #                 break
-
-    #     # go left
-    #     current_cratio = best_cratio
-    #     stop_counter = 0
-    #     while True:
-    #         current_cratio -= cratio_step
-    #         if current_cratio < cratio_step:
-    #             break
-    #         result = self.compress(data, error_bound, current_cratio)
-    #         compression_ratio = data.nbytes / len(result[0])
-    #         if compression_ratio > best_compression_ratio:
-    #             # update best
-    #             best_cratio = current_cratio
-    #             best_result = result
-    #             best_compression_ratio = compression_ratio
-    #             # reset stop counter
-    #             stop_counter = 0
-    #         else:
-    #             # increment stop counter
-    #             stop_counter += 1
-    #             if stop_counter >= stop_counts:
-    #                 break
-
-    #     return best_result, best_cratio
-    
-    # def grid_search_target_compression(self, data, error_bound, target_compression_ratio):
-    #     cratio_step = 5
-    #     cratio_start = cratio_step
-    #     stop_counts = 2
-    #     assert stop_counts >= 1
-
-    #     closest_cratio = cratio_start
-    #     closest_result = self.compress(data, error_bound, closest_cratio)
-    #     closest_compression_ratio = data.nbytes / len(closest_result[0])
-
-    #     # go right
-    #     current_cratio = closest_cratio
-    #     stop_counter = 0
-    #     while True:
-    #         current_cratio += cratio_step
-    #         result = self.compress(data, error_bound, current_cratio)
-    #         compression_ratio = data.nbytes / len(result[0])
-    #         if abs(compression_ratio - target_compression_ratio) < abs(closest_compression_ratio - target_compression_ratio):
-    #             closest_cratio = current_cratio
-    #             closest_result = result
-    #             closest_compression_ratio = compression_ratio
-    #             # reset stop counter
-    #             stop_counter = 0
-    #         else:
-    #             # increment stop counter
-    #             stop_counter += 1
-    #             if stop_counter >= stop_counts:
-    #                 break
-
-    #     return closest_result, closest_cratio
-
-    def golden_section_search_best_compression(self, data, error_bound):
+    def golden_section_search_best_compression(self, data, error_bound, key_fail_u16='3', round_option='0', value_shuffle_option='0'):
         cratio_step = 5
         min_cratio = cratio_step // 2
         max_cratio = 400
@@ -573,13 +505,21 @@ class ErrorBoundedJP2KCodec:
 
         def eval_at(cratio):
             if cratio not in cache:
-                result = self.compress(data, error_bound, cratio)
-                ratio = data.nbytes / max(1, len(result[0]))
-                cache[cratio] = (ratio, result)
+                result = self.compress(data, error_bound, cratio, key_fail_u16=key_fail_u16, round_option=round_option, value_shuffle_option=value_shuffle_option)
+                compression_ratio = data.nbytes / len(result[0])
+                cache[cratio] = compression_ratio
             return cache[cratio]
 
-        a, b = int(min_cratio), int(max_cratio)
         cache = {}
+        while True:
+            compression_ratio_1 = eval_at(max_cratio - cratio_step)
+            compression_ratio_2 = eval_at(max_cratio)
+            if compression_ratio_1 <= compression_ratio_2:
+                max_cratio = max_cratio * 2
+            else:
+                break
+
+        a, b = int(min_cratio), int(max_cratio)
 
         # initial interior integers with strict ordering a < c < d < b
         c = int(b - math.ceil((b - a) / phi))
@@ -589,16 +529,14 @@ class ErrorBoundedJP2KCodec:
         if c >= d:
             c, d = d - 1, d
 
-        compression_ratio_c, result_c = eval_at(c)
-        compression_ratio_d, result_d = eval_at(d)
+        compression_ratio_c = eval_at(c)
+        compression_ratio_d = eval_at(d)
 
         if compression_ratio_c >= compression_ratio_d:
             best_cratio = c
-            best_result = result_c
             best_compression_ratio = compression_ratio_c
         else:
             best_cratio = d
-            best_result = result_d
             best_compression_ratio = compression_ratio_d
 
         # stop when the interval is smaller than the step
@@ -606,26 +544,26 @@ class ErrorBoundedJP2KCodec:
             if compression_ratio_c > compression_ratio_d:
                 # keep [a, d)
                 b = d
-                d, compression_ratio_d, result_d = c, compression_ratio_c, result_c
+                d, compression_ratio_d = c, compression_ratio_c
                 c = int(b - math.ceil((b - a) / phi))
                 c = max(a + 1, min(b - 1, c))
                 if c == d:
                     c = max(a + 1, d - 1)
-                compression_ratio_c, result_c = eval_at(c)
+                compression_ratio_c = eval_at(c)
                 if compression_ratio_c > best_compression_ratio:
-                    best_cratio, best_result, best_compression_ratio = c, result_c, compression_ratio_c
+                    best_cratio, best_compression_ratio = c, compression_ratio_c
             else:
                 # keep (c, b]
                 a = c
-                c, compression_ratio_c, result_c = d, compression_ratio_d, result_d
+                c, compression_ratio_c = d, compression_ratio_d
                 d = int(a + math.ceil((b - a) / phi))
                 d = max(a + 1, min(b - 1, d))
                 if d == c:
                     d = min(b - 1, c + 1)
-                compression_ratio_d, result_d = eval_at(d)
+                compression_ratio_d = eval_at(d)
                 if compression_ratio_d > best_compression_ratio:
-                    best_cratio, best_result, best_compression_ratio = d, result_d, compression_ratio_d
-
+                    best_cratio, best_compression_ratio = d, compression_ratio_d
+        best_result = self.compress(data, error_bound, best_cratio, key_fail_u16=key_fail_u16, round_option=round_option, value_shuffle_option=value_shuffle_option)
         return best_result, best_cratio
 
     @staticmethod

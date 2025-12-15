@@ -94,7 +94,9 @@ def run_search(
   month,
   variable,
   ratio,
-  mode,
+  key_fail_u16='3',
+  round_option='0',
+  value_shuffle_option='0',
 ):
   reanalysis_file = os.path.join(era5_path, f"single_level/reanalysis/{year}/{month}/{variable}.npy")
   spread_file = os.path.join(era5_path, f"single_level/interpolated_ensemble_spread/{year}/{month}/{variable}.npy")
@@ -118,13 +120,7 @@ def run_search(
 
   # print(f"Running search for {variable} ...")
   compression_start_time = time.time()
-  if mode == "full_scale":
-    (blob, info), best_cratio = codec.golden_section_search_best_compression(data, error_bound)
-  elif mode == "half_resolution":
-    (blob, info), best_cratio = codec.golden_section_search_best_compression(data[..., ::2, ::2], error_bound[..., ::2, ::2])
-  else:
-    raise ValueError(f"Unknown mode: {mode}")
-  blob, info = codec.compress(data, error_bound, best_cratio)
+  (blob, info), best_cratio = codec.golden_section_search_best_compression(data, error_bound, key_fail_u16=key_fail_u16, round_option=round_option, value_shuffle_option=value_shuffle_option)
   compression_end_time = time.time()
   compression_time = compression_end_time - compression_start_time
 
@@ -144,7 +140,9 @@ def run_search(
     "year": year,
     "month": month,
     "ratio": ratio,
-    "mode": mode,
+    "key_fail_u16": key_fail_u16,
+    "round_option": round_option,
+    "value_shuffle_option": value_shuffle_option,
     "best_cratio": best_cratio,
     "data_size": data_size,
     "check_passed": check_passed,
@@ -171,7 +169,7 @@ def main():
   era5_path = "/iopsstor/scratch/cscs/ljiayong/cache/era5_npy"
   year = '2024'
   month = '10'
-  ratio = 0.5
+  ratio = 1
   variables = [
     # "100m_u_component_of_wind",
     # "100m_v_component_of_wind",
@@ -193,39 +191,15 @@ def main():
   ]
 
   num_processes = 16
-  pool = Pool(processes=num_processes)
-  results = []
-  for variable in variables:
-    for cratio in range(10, 101, 5):
-      args = (era5_path, year, month, variable, ratio, cratio)
-      if num_processes > 1:
-        result = pool.apply_async(run_scan, args=args)
-      else:
-        result = run_scan(*args)
-      results.append(result)
-  pool.close()
-  for idx in tqdm(range(len(results))):
-    result = results[idx]
-    if num_processes > 1:
-      result = result.get()
-
-    results[idx] = result
-    df = pd.DataFrame(results[:idx+1])
-    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/scan_cratio_single_level_{year}_{month}_{ratio}.csv")
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
-  
-  pool.join()
-
   # pool = Pool(processes=num_processes)
   # results = []
   # for variable in variables:
-  #   for mode in ["full_scale"]:
-  #     args = (era5_path, year, month, variable, ratio, mode)
+  #   for cratio in range(10, 101, 5):
+  #     args = (era5_path, year, month, variable, ratio, cratio)
   #     if num_processes > 1:
-  #       result = pool.apply_async(run_search, args=args)
+  #       result = pool.apply_async(run_scan, args=args)
   #     else:
-  #       result = run_search(*args)
+  #       result = run_scan(*args)
   #     results.append(result)
   # pool.close()
   # for idx in tqdm(range(len(results))):
@@ -235,11 +209,37 @@ def main():
 
   #   results[idx] = result
   #   df = pd.DataFrame(results[:idx+1])
-  #   output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/golden_section_search_single_level_{year}_{month}_{ratio}.csv")
+  #   output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/scan_cratio_single_level_{year}_{month}_{ratio}.csv")
   #   os.makedirs(os.path.dirname(output_csv), exist_ok=True)
   #   df.to_csv(output_csv, index=False)
-
+  
   # pool.join()
+
+  pool = Pool(processes=num_processes)
+  results = []
+  for variable in variables:
+    for key_fail_u16 in ["3"]:
+      for round_option in ["0", "1", "2"]:
+        for value_shuffle_option in ["0", "1"]:
+          args = (era5_path, year, month, variable, ratio, key_fail_u16, round_option, value_shuffle_option)
+          if num_processes > 1:
+            result = pool.apply_async(run_search, args=args)
+          else:
+            result = run_search(*args)
+          results.append(result)
+  pool.close()
+  for idx in tqdm(range(len(results))):
+    result = results[idx]
+    if num_processes > 1:
+      result = result.get()
+
+    results[idx] = result
+    df = pd.DataFrame(results[:idx+1])
+    output_csv = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"results/golden_section_search_single_level_{year}_{month}_{ratio}.csv")
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    df.to_csv(output_csv, index=False)
+
+  pool.join()
 
 if __name__ == "__main__":
   main()
